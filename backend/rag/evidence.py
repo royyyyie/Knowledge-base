@@ -58,6 +58,8 @@ def _document_parts(
     projected = dict(document)
     source = str(document.get("filename") or "Unknown")[:240]
     page = str(document.get("page_number") or "N/A")[:40]
+    section = str(document.get("section_id") or "")[:256]
+    file_type = str(document.get("file_type") or "")
     text = str(document.get("text") or "")
     truncated = False
     if max_document_characters is not None and len(text) > max_document_characters:
@@ -65,7 +67,12 @@ def _document_parts(
         text += _TRUNCATION_MARKER
         projected["text"] = text
         truncated = True
-    rendered = f"{source} (Page {page}):\n{text}"
+    if file_type == "PDF" and section.startswith("pdf:"):
+        rendered = f"{source} (Page {page}; {section}):\n{text}"
+    elif file_type in {"Word", "Excel"} and section:
+        rendered = f"{source} ({section}):\n{text}"
+    else:
+        rendered = f"{source} (Page {page}):\n{text}"
     return projected, rendered, truncated
 
 

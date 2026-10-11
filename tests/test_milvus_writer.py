@@ -53,15 +53,30 @@ class FakeEmbeddingService:
         return [[float(idx)] for idx, _ in enumerate(texts, start=1)]
 
 
+class FakeM3EmbeddingService:
+    def __init__(self, events):
+        self.events = events
+
+    def embed_m3_documents(self, texts):
+        self.events.append(("embed_m3", list(texts)))
+        return [
+            types.SimpleNamespace(dense=[float(index)], sparse={42: 0.5})
+            for index, _ in enumerate(texts, start=1)
+        ]
+
+
 class ShortEmbeddingService:
     def get_embeddings(self, texts):
         return [[1.0]] * max(len(texts) - 1, 0)
 
 
 class VersionedStore:
-    def __init__(self, events, collection_name="documents", registry=None):
+    def __init__(
+        self, events, collection_name="documents", registry=None, sparse_mode="bm25"
+    ):
         self.events = events
         self.collection_name = collection_name
+        self.sparse_mode = sparse_mode
         self.registry = registry if registry is not None else {}
         self.registry[collection_name] = self
         self.insert_responses = []
@@ -71,7 +86,7 @@ class VersionedStore:
     def with_collection(self, name):
         self.events.append(("with_collection", name))
         if name not in self.registry:
-            VersionedStore(self.events, name, self.registry)
+            VersionedStore(self.events, name, self.registry, self.sparse_mode)
         return self.registry[name]
 
     def init_collection(self, dense_dim):
@@ -138,6 +153,23 @@ def versioned_document(index, *, version="version-1", document="doc-1"):
 
 
 class MilvusWriterTests(unittest.TestCase):
+    def test_m3_write_uses_isolated_layout_and_both_model_heads(self):
+        module = load_milvus_writer_module()
+        events = []
+        store = VersionedStore(events, sparse_mode="bge_m3")
+        writer = module.MilvusWriter(
+            embedding_service=FakeM3EmbeddingService(events),
+            milvus_manager=store,
+        )
+
+        receipt = writer.write_versioned_documents([versioned_document(0)])
+
+        self.assertEqual("documents_catalog_m3_v1", receipt.collection_name)
+        self.assertIn(("embed_m3", ["text 0"]), events)
+        inserted = next(event for event in events if event[0] == "versioned_insert")
+        self.assertEqual([1.0], inserted[2][0]["dense_embedding"])
+        self.assertEqual({42: 0.5}, inserted[2][0]["m3_sparse_embedding"])
+
     def test_versioned_write_defaults_to_isolated_catalog_collection_and_receipt(self):
         module = load_milvus_writer_module()
         events = []
@@ -179,6 +211,7 @@ class MilvusWriterTests(unittest.TestCase):
         first_payload = versioned_inserts[0][2][0]
         self.assertEqual(["team:legal"], first_payload["acl_tags"])
         self.assertEqual("version-1", first_payload["document_version_id"])
+        self.assertEqual("section-1", first_payload["section_id"])
         self.assertEqual("index-v2", first_payload["index_version"])
         self.assertNotIn(
             "documents",

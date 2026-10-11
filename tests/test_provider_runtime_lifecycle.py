@@ -78,6 +78,26 @@ class _FakeReranker:
 
 
 class ProviderRuntimeTests(unittest.IsolatedAsyncioTestCase):
+    async def test_colbert_reranker_reuses_embedding_runtime_without_loading_model(
+        self,
+    ):
+        settings = get_settings().model_copy(deep=True)
+        settings.embedding.backend = "bge_m3"
+        settings.embedding.max_concurrency = 1
+        settings.embedding.executor_workers = 1
+        settings.embedding.warmup_on_start = False
+        settings.rerank.backend = "colbert"
+        bridge = ProviderLoopBridge(thread_name="provider-runtime-colbert-test")
+        runtime = ProviderRuntime(settings=settings, bridge=bridge)
+        try:
+            await runtime.start()
+            reranker = runtime.get_reranker_sync()
+            self.assertTrue(reranker.enabled)
+            self.assertIn(":colbert", reranker.model)
+            self.assertFalse(runtime.embedding_runtime.readiness().model_loaded)
+        finally:
+            await runtime.aclose()
+
     async def test_resources_are_created_and_closed_on_the_bridge_owner_loop(self):
         settings = get_settings().model_copy(deep=True)
         settings.embedding.warmup_on_start = False

@@ -6,9 +6,12 @@ import time
 from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
 from numbers import Real
-from typing import Any, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
 import httpx
+
+if TYPE_CHECKING:
+    from backend.providers.embedding import EmbeddingRuntime
 
 from backend.providers.core import (
     ProviderCallContext,
@@ -93,6 +96,91 @@ class DisabledRerankerAdapter:
         if cancellation is not None and cancellation():
             raise asyncio.CancelledError("rerank call cancelled")
         return RerankResult(items=(), attempts=0)
+
+    async def aclose(self) -> None:
+        return None
+
+
+class ColbertRerankerAdapter:
+    """Score bounded candidates with the existing BGE-M3 embedding runtime."""
+
+    enabled = True
+
+    def __init__(
+        self,
+        *,
+        embedding_runtime: EmbeddingRuntime,
+        model: str,
+        timeout_seconds: float,
+        executor: ProviderExecutor = provider_executor,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
+        if embedding_runtime.backend != "bge_m3":
+            raise ValueError("ColBERT requires a BGE-M3 embedding runtime")
+        if (
+            not model.strip()
+            or timeout_seconds <= 0
+            or not math.isfinite(timeout_seconds)
+        ):
+            raise ValueError("invalid ColBERT model or timeout")
+        self._embedding_runtime = embedding_runtime
+        self._executor = executor
+        self._clock = clock
+        self.model = model
+        self.timeout_seconds = float(timeout_seconds)
+
+    async def rerank(
+        self,
+        *,
+        query: str,
+        documents: Sequence[str],
+        top_n: int,
+        deadline: float | None = None,
+        cancellation: CancellationProbe | None = None,
+    ) -> RerankResult:
+        if isinstance(documents, (str, bytes)) or not isinstance(documents, Sequence):
+            raise TypeError("documents must be a sequence of strings")
+        if any(
+            not isinstance(document, str) or not document.strip()
+            for document in documents
+        ):
+            raise ValueError("ColBERT documents must be non-empty strings")
+        if not isinstance(query, str) or not query.strip():
+            raise ValueError("ColBERT query must be non-empty")
+        if isinstance(top_n, bool) or not isinstance(top_n, int) or top_n <= 0:
+            raise ValueError("top_n must be a positive int")
+        if cancellation is not None and cancellation():
+            raise asyncio.CancelledError("ColBERT rerank cancelled")
+        if not documents:
+            return RerankResult(items=(), attempts=0)
+        stage_deadline = min(
+            deadline if deadline is not None else float("inf"),
+            self._clock() + self.timeout_seconds,
+        )
+        context = ProviderCallContext(
+            provider=self.model,
+            operation=ProviderOperation.RERANK,
+            deadline=stage_deadline,
+            cancellation=cancellation,
+        )
+
+        async def attempt() -> tuple[RerankItem, ...]:
+            scores = await self._embedding_runtime.score_m3_colbert(
+                query, documents, cancellation=cancellation
+            )
+            return tuple(
+                RerankItem(index=index, score=score)
+                for index, score in sorted(
+                    enumerate(scores), key=lambda item: (-item[1], item[0])
+                )[:top_n]
+            )
+
+        items = await self._executor.acall(
+            attempt,
+            context=context,
+            policy=ProviderPolicy(max_attempts=1),
+        )
+        return RerankResult(items=items, attempts=1)
 
     async def aclose(self) -> None:
         return None

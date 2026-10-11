@@ -37,6 +37,17 @@ reserve candidate/version + durable Index Job
 
 相同 `content_sha256 + build_fingerprint` 只在 current 或 pending 活跃版本上幂等复用。`failed` 与 `superseded` 是不可逆终态；同内容再次提交会获得新的 Document Version 与 Index Job。`build_fingerprint` 至少覆盖 parser、chunker、Embedding 和 index layout 版本。
 
+可选 BGE-M3 模型 Sparse 布局使用独立的 `_catalog_m3_v1` collection，
+由同一 Index Job 在候选 Document Version scope 中同时写入 Dense 和模型词项权重。
+build profile 记录 Embedding backend、Sparse 模式和查询/文档 token 截断长度；
+切换模式必须产生新的 Document Version，不得在已有 BM25 collection 上原地改写。
+
+PDF、Word、Excel 的格式专用解析器只产生带稳定来源位置的内部元素，仍由同一
+`DocumentPublication.run()` 在 candidate scope 内转换成版本化三级块。PDF 页/区域、Word
+块序号、Excel 工作表/行范围复用现有 `section_id` 与 `page_number` 字段，不创建第二套
+Document 或索引事实。结构化元素边界和行事实发生变化时须更新 parser/chunker version，
+旧 Document Version 不原地重写。
+
 唯一延迟物理清理的场景是：新 Document Version 原子发布成功后，previous current 固定保留 1 小时，供 publish commit 前已经取得其 Retrieval Scope 的并发查询完成。这个时长是 Catalog 内部不变量，不是配置项，也不暴露为调用参数。
 
 以下路径全部使用数据库当前时间作为 cleanup due time，立即允许 worker claim：

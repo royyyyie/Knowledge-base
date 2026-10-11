@@ -264,12 +264,14 @@ class RagEvalObservation(StrictEvalModel):
     provider_error_stage: RagProviderErrorStage | None = None
     duration_ms: float = Field(ge=0, allow_inf_nan=False)
     judge: RagJudgeMetrics | None = None
+    retrieval_index_ids: tuple[Identifier, ...] = ()
     retrieved_chunks: tuple[RagRetrievedChunk, ...] = ()
     initial_retrieved_chunks: tuple[RagRetrievedChunk, ...] = ()
     rewrite_retrieved_chunks: tuple[RagRetrievedChunk, ...] = ()
 
     @model_validator(mode="after")
     def validate_rankings(self) -> RagEvalObservation:
+        _require_unique(self.retrieval_index_ids, "retrieval index ids")
         for name, chunks in (
             ("retrieved_chunks", self.retrieved_chunks),
             ("initial_retrieved_chunks", self.initial_retrieved_chunks),
@@ -441,6 +443,22 @@ _JUDGE_METRICS = (
     "conflict_disclosure_rate",
 )
 
+_BASELINE_IDENTITY_FIELDS = (
+    "adapter",
+    "provenance",
+    "evaluation_mode",
+    "gate_policy_fingerprint",
+    "corpus_id",
+    "corpus_fingerprint",
+    "profile_id",
+    "index_id",
+    "profile_fingerprint",
+    "rag_source_fingerprint",
+    "model_catalog_hash",
+    "retrieval_index_ids",
+    "judge_schema_version",
+)
+
 
 def load_rag_eval_dataset(path: str | Path) -> RagEvalDataset:
     return RagEvalDataset.model_validate(_load_json(path))
@@ -461,6 +479,31 @@ def load_rag_eval_report(path: str | Path) -> RagEvalReport:
 def dataset_fingerprint(dataset: RagEvalDataset) -> str:
     payload = _canonical_json(dataset.model_dump(mode="json"))
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def gate_policy_fingerprint(policy: RagEvalGatePolicy) -> str:
+    payload = _canonical_json(policy.model_dump(mode="json"))
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def require_comparable_baseline(
+    metadata: dict[str, JsonValue], baseline: RagEvalReport
+) -> None:
+    """Reject baseline deltas across a different execution or source identity."""
+
+    mismatches = [
+        key
+        for key in _BASELINE_IDENTITY_FIELDS
+        if not (
+            key == "rag_source_fingerprint"
+            and metadata.get("source_mismatch_override") is True
+        )
+        and baseline.metadata.get(key) != metadata.get(key)
+    ]
+    if mismatches:
+        raise DatasetFingerprintMismatch(
+            "baseline source identity differs: " + ", ".join(mismatches)
+        )
 
 
 def evaluate_rag(
@@ -534,6 +577,8 @@ def _evaluate_rag(
         raise DatasetFingerprintMismatch(
             "baseline dataset fingerprint does not match the dataset"
         )
+    if baseline is not None:
+        require_comparable_baseline(metadata or {}, baseline)
 
     case_index = {case.id: case for case in dataset.cases}
     observation_index = _index_observations(observation_values)
@@ -626,6 +671,7 @@ def render_rag_eval_markdown(report: RagEvalReport) -> str:
         f"- Dataset: `{report.dataset_name}`",
         f"- Fingerprint: `{report.dataset_fingerprint}`",
         f"- Cases: {report.case_count}",
+        f"- Answer Judge: {_judge_coverage_label(report)}",
         "",
         "## Metrics",
         "",
@@ -686,6 +732,19 @@ def render_rag_eval_markdown(report: RagEvalReport) -> str:
         for name, reason in sorted(report.unavailable_metrics.items())
     )
     return "\n".join(lines) + "\n"
+
+
+def _judge_coverage_label(report: RagEvalReport) -> str:
+    judged = sum(
+        case.metrics.get("answer_correctness") is not None for case in report.cases
+    )
+    if judged == 0:
+        status = "not evaluated"
+    elif judged < report.case_count:
+        status = "partially evaluated"
+    else:
+        status = "evaluated"
+    return f"{status} ({judged}/{report.case_count})"
 
 
 def _load_json(path: str | Path) -> Any:
@@ -1064,6 +1123,13 @@ def _aggregate_metrics(
         value=_mean([float(case.passed) for case in cases]),
         eligible_cases=len(cases),
     )
+    judge_coverage_values = [
+        float(observation.judge is not None) for observation in observations.values()
+    ]
+    aggregated["judge_coverage_rate"] = RagMetricResult(
+        value=_mean(judge_coverage_values),
+        eligible_cases=len(judge_coverage_values),
+    )
     rewrite_coverage_values = [
         float(observation.rewrite_performed) for observation in observations.values()
     ]
@@ -1140,6 +1206,14 @@ def _evaluate_gates(
     metadata: dict[str, JsonValue],
 ) -> list[RagGateResult]:
     results: list[RagGateResult] = []
+    if metadata.get("source_mismatch_override") is True:
+        results.append(
+            RagGateResult(
+                name="source_identity_override",
+                status=GateStatus.FAILED,
+                detail="source mismatch override is for investigation only",
+            )
+        )
     if policy.required_provenance is not None:
         actual_provenance = metadata.get("provenance")
         matches = actual_provenance == policy.required_provenance

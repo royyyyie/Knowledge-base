@@ -880,6 +880,7 @@ const metricLabels: Record<string, string> = {
   hitl_accuracy: 'HITL accuracy',
   provider_failure_rate: 'Provider failure',
   case_pass_rate: 'Case pass rate',
+  judge_coverage_rate: 'Judge coverage',
   duration_ms: 'Latency',
   latency_p50_ms: 'Latency p50',
   latency_p95_ms: 'Latency p95',
@@ -897,6 +898,7 @@ const metricLabels: Record<string, string> = {
 
 const preferredHeadlineMetrics = [
   'case_pass_rate',
+  'judge_coverage_rate',
   'hit_at_5',
   'hit_at_10',
   'rewrite_coverage_rate',

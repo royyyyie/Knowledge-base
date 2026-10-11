@@ -29,7 +29,11 @@ from backend.providers import (
 from backend.providers.runtime import provider_runtime
 from backend.rag.reranking import RerankStage
 from pydantic import BaseModel, Field
-from backend.agent.models import ModelRole, model_registry
+from backend.agent.models import (
+    ModelRole,
+    invoke_json_structured_output,
+    model_registry,
+)
 from backend.model_control import ModelCatalogSnapshot
 
 try:
@@ -55,7 +59,7 @@ _RETRIEVAL_CANDIDATE_K_RAW = os.getenv("RETRIEVAL_CANDIDATE_K", "").strip()
 RETRIEVAL_TOP_K = _read_positive_int_env("RETRIEVAL_TOP_K", 8)
 
 
-RERANK_MIN_SCORE = provider_runtime.settings.rerank.min_score
+RERANK_MIN_SCORE = provider_runtime.settings.rerank.effective_min_score
 
 RETRIEVAL_TRACE_FIELDS = (
     "retrieval_pipeline",
@@ -526,8 +530,10 @@ def rewrite_query_once(
             timeout_seconds = 15.0
 
     result = _provider_executor.call(
-        lambda: model.with_structured_output(RewritePlan).invoke(
-            [{"role": "user", "content": REWRITE_PROMPT.format(query=query)}]
+        lambda: invoke_json_structured_output(
+            model,
+            RewritePlan,
+            [{"role": "user", "content": REWRITE_PROMPT.format(query=query)}],
         ),
         context=ProviderCallContext(
             provider=provider_name,
@@ -585,6 +591,7 @@ def _retrieve_target(
     target: RetrievalTarget,
     *,
     dense_embedding: list[float],
+    sparse_embedding: dict[int, float] | None,
     query: str,
     candidate_k: int,
     vector_deadline: float,
@@ -603,11 +610,24 @@ def _retrieve_target(
             if target.required:
                 raise RuntimeError("required Milvus target collection is missing")
             return True, "missing_optional", []
+        target_sparse_mode = getattr(
+            store,
+            "sparse_mode",
+            "bge_m3" if target.collection_name.endswith("_catalog_m3_v1") else "bm25",
+        )
+        if target_sparse_mode == "bge_m3" and sparse_embedding is None:
+            raise ValueError("BGE-M3 target requires a sparse query vector")
         try:
+            sparse_kwargs = (
+                {"sparse_embedding": sparse_embedding}
+                if target_sparse_mode == "bge_m3"
+                else {}
+            )
             documents = _validate_retrieved_documents(
                 store.hybrid_retrieve(
                     dense_embedding=dense_embedding,
                     query=query,
+                    **sparse_kwargs,
                     top_k=candidate_k,
                     filter_expr=target.filter_expr,
                     timeout=_remaining_timeout(
@@ -618,6 +638,8 @@ def _retrieve_target(
             )
             return False, "hybrid", documents
         except HybridRetrievalUnsupported:
+            if target_sparse_mode == "bge_m3":
+                raise
             documents = _validate_retrieved_documents(
                 store.dense_retrieve(
                     dense_embedding=dense_embedding,
@@ -762,9 +784,22 @@ def retrieve_documents(
         index_id=snapshot.index_id,
     )
 
-    def _embed_query() -> list[float]:
-        query_method = getattr(_embedding_service, "embed_query", None)
-        if callable(query_method):
+    def _embed_query() -> tuple[list[float], dict[int, float] | None]:
+        need_m3_sparse = any(
+            target.collection_name.endswith("_catalog_m3_v1")
+            for target in snapshot.targets
+        )
+        if need_m3_sparse:
+            features = _embedding_service.embed_m3_query(
+                query,
+                deadline=embedding_deadline,
+                cancellation=cancellation,
+            )
+            vector = features.dense
+            sparse_vector = features.sparse
+            if not sparse_vector:
+                raise ValueError("BGE-M3 returned no sparse query weights")
+        elif callable(query_method := getattr(_embedding_service, "embed_query", None)):
             vector = query_method(
                 query,
                 scope=embedding_scope,
@@ -776,6 +811,8 @@ def retrieve_documents(
             if not dense_embeddings:
                 raise ValueError("embedding provider returned no vector")
             vector = dense_embeddings[0]
+        if not need_m3_sparse:
+            sparse_vector = None
         if not vector:
             raise ValueError("embedding provider returned no vector")
         if not isinstance(vector, list) or any(
@@ -785,10 +822,10 @@ def retrieve_documents(
             for value in vector
         ):
             raise ValueError("embedding provider returned an invalid vector")
-        return [float(value) for value in vector]
+        return [float(value) for value in vector], sparse_vector
 
     try:
-        dense_embedding = _embed_query()
+        dense_embedding, sparse_embedding = _embed_query()
     except asyncio.CancelledError:
         raise
     except ProviderError:
@@ -811,6 +848,7 @@ def retrieve_documents(
         missing, mode, documents = _retrieve_target(
             target,
             dense_embedding=dense_embedding,
+            sparse_embedding=sparse_embedding,
             query=query,
             candidate_k=candidate_k,
             vector_deadline=vector_deadline,

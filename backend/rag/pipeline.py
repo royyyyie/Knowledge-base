@@ -10,7 +10,11 @@ from langgraph.types import Command, Send, interrupt
 from pydantic import BaseModel, Field
 
 from backend.core.errors import AppError, ErrorCode
-from backend.agent.models import ModelRole, model_registry
+from backend.agent.models import (
+    ModelRole,
+    invoke_json_structured_output,
+    model_registry,
+)
 from backend.model_control import ModelCatalogSnapshot
 from backend.runs.request_context import RunRequestContext
 from backend.schemas.rag import HitlResumeState, normalize_rag_sub_trace
@@ -207,7 +211,9 @@ def _copy_jsonable_doc(doc: dict) -> dict:
     """Keep resume snapshots small and JSON-safe."""
     allowed = {
         "filename",
+        "file_type",
         "page_number",
+        "section_id",
         "text",
         "score",
         "rrf_rank",
@@ -361,7 +367,7 @@ def _invoke_structured_model(
         cancellation=cancellation,
     )
     return _provider_executor.call(
-        lambda: model.with_structured_output(schema).invoke(messages),
+        lambda: invoke_json_structured_output(model, schema, messages),
         context=context,
         policy=_model_policy,
     )

@@ -1,4 +1,6 @@
+import os
 import unittest
+from unittest.mock import patch
 
 from pydantic import SecretStr, ValidationError
 
@@ -70,7 +72,9 @@ def make_settings(
 
 class SettingsSecurityTests(unittest.TestCase):
     def test_agent_model_call_budget_defaults_to_five_calls(self):
-        self.assertEqual(5, AgentSettings(_env_file=None).max_model_calls)
+        with patch.dict(os.environ):
+            os.environ.pop("AGENT_MAX_MODEL_CALLS", None)
+            self.assertEqual(5, AgentSettings(_env_file=None).max_model_calls)
 
     def test_embedding_query_microbatch_is_disabled_by_default(self):
         self.assertEqual(
@@ -256,6 +260,18 @@ class SettingsSecurityTests(unittest.TestCase):
         self.assertFalse(settings.rerank.enabled)
         self.assertEqual("", settings.rerank.endpoint)
 
+    def test_m3_sparse_requires_shared_m3_encoder(self):
+        settings = make_settings(secret="x" * 40)
+        settings.embedding.sparse_mode = "bge_m3"
+        with self.assertRaisesRegex(ValueError, "EMBEDDING_BACKEND=bge_m3"):
+            settings.validate_startup()
+
+    def test_colbert_uses_local_model_and_its_own_score_scale(self):
+        rerank = RerankSettings(_env_file=None, RERANK_BACKEND="colbert")
+        self.assertTrue(rerank.enabled)
+        self.assertEqual("", rerank.endpoint)
+        self.assertEqual(-1.0, rerank.effective_min_score)
+
     def test_rerank_min_score_rejects_non_finite_values(self):
         with self.assertRaises(ValidationError):
             RerankSettings(_env_file=None, RERANK_MIN_SCORE="nan")
@@ -302,7 +318,10 @@ class SettingsSecurityTests(unittest.TestCase):
         )
 
     def test_sql_assistant_is_disabled_and_secretless_by_default(self):
-        sql = SqlAssistantSettings(_env_file=None)
+        with patch.dict(os.environ):
+            os.environ.pop("SQL_ASSISTANT_ALLOWED_SCHEMAS", None)
+            os.environ.pop("SQL_ASSISTANT_ALLOWED_TABLES", None)
+            sql = SqlAssistantSettings(_env_file=None)
 
         self.assertFalse(sql.enabled)
         self.assertEqual("", sql.dsn.get_secret_value())

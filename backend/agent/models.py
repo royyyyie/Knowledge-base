@@ -5,9 +5,11 @@ from dataclasses import dataclass
 import hashlib
 import json
 from threading import RLock
+from typing import TypeVar
 
 from langchain.chat_models import init_chat_model
 from langchain_core.language_models.chat_models import BaseChatModel
+from pydantic import BaseModel
 
 from backend.core.errors import AppError, ErrorCode
 from backend.core.settings import AppSettings, get_settings
@@ -51,6 +53,39 @@ class ModelSpec:
 
 
 ModelInitializer = Callable[..., BaseChatModel]
+SchemaT = TypeVar("SchemaT", bound=BaseModel)
+
+
+def invoke_json_structured_output(
+    model: BaseChatModel,
+    schema: type[SchemaT],
+    messages: list[dict[str, str]],
+) -> SchemaT:
+    """Use a single JSON-mode request for OpenAI-compatible structured models."""
+    if not messages or messages[0].get("role") != "user":
+        raise ValueError("structured model requires a leading user message")
+    instruction = (
+        "只返回符合以下 JSON Schema 的 JSON 对象，不要添加 Markdown 或其他文字：\n"
+        + json.dumps(
+            schema.model_json_schema(),
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+    )
+    prompt_messages = [
+        {
+            **messages[0],
+            "content": f"{instruction}\n\n{messages[0]['content']}",
+        },
+        *messages[1:],
+    ]
+    result = model.with_structured_output(schema, method="json_mode").invoke(
+        prompt_messages
+    )
+    if not isinstance(result, schema):
+        raise TypeError("structured model returned an invalid schema result")
+    return result
 
 
 class ModelRegistry:

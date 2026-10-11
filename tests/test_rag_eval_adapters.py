@@ -12,8 +12,10 @@ import pytest
 from backend.evaluation.rag import (
     RagEvalCase,
     RagEvalDataset,
+    RagEvalObservation,
     RagEvalObservationBundle,
     RagExpectedBehavior,
+    RagJudgeMetrics,
     RagProviderErrorStage,
 )
 from backend.evaluation.rag_adapters import (
@@ -56,6 +58,7 @@ def test_projection_keeps_identity_and_hash_but_never_chunk_text():
         "retrieval_outcome": "ANSWERABLE",
         "rag_trace": {
             "complexity": "simple",
+            "retrieval_index_id": "catalog-index-v1",
             "retrieved_chunks": [
                 {
                     "chunk_id": "doc::p0::l3::0",
@@ -86,6 +89,7 @@ def test_projection_keeps_identity_and_hash_but_never_chunk_text():
     assert observation.complexity.value == "simple"
     assert observation.retrieved_chunks[0].chunk_id == "doc::p0::l3::0"
     assert observation.retrieved_chunks[0].canonical_name == "doc.html"
+    assert observation.retrieval_index_ids == ("catalog-index-v1",)
     assert observation.retrieved_chunks[0].content_sha256 == manifest_hash.lower()
     serialized = json.dumps(observation.model_dump(mode="json"))
     assert "private evidence body" not in serialized
@@ -426,6 +430,66 @@ def test_live_adapter_rejects_catalog_index_changes_between_cases(monkeypatch):
         LiveRagEvalAdapter(expected_index_id="catalog-index-v1").execute(dataset)
 
 
+def test_live_adapter_judged_mode_reuses_evaluation_runtime_and_frozen_snapshot(
+    monkeypatch,
+):
+    class Runtime:
+        def readiness(self):
+            return SimpleNamespace(running=False)
+
+        def start_sync(self):
+            return None
+
+        def close_sync(self):
+            return None
+
+    _install_live_modules(
+        monkeypatch,
+        runtime=Runtime(),
+        run_graph=lambda *_args, **_kwargs: pytest.fail("duplicate RAG execution"),
+    )
+    calls = []
+    judge = RagJudgeMetrics(
+        answer_correctness=1,
+        groundedness=1,
+        answer_relevance=1,
+        completeness=1,
+        context_relevance=1,
+        unsupported_claim_rate=0,
+        conflict_disclosure_rate=1,
+    )
+
+    class FakeEvaluationRuntime:
+        def execute_case(self, **kwargs):
+            calls.append(kwargs)
+            return SimpleNamespace(
+                observation=RagEvalObservation(
+                    case_id=kwargs["case"].id,
+                    duration_ms=1,
+                    judge=judge,
+                    retrieval_index_ids=("catalog-index-v1",),
+                ),
+            )
+
+    evaluation_module = types.ModuleType("backend.evaluation.runtime")
+    evaluation_module.RagEvaluationRuntime = FakeEvaluationRuntime
+    monkeypatch.setitem(sys.modules, "backend.evaluation.runtime", evaluation_module)
+    first = _case()
+    second = first.model_copy(update={"id": "case_2", "question": "question two"})
+    dataset = RagEvalDataset(name="dataset", cases=(first, second))
+
+    bundle = LiveRagEvalAdapter(
+        expected_index_id="catalog-index-v1",
+        user_id="evaluation-user",
+        judge_answers=True,
+    ).execute(dataset)
+
+    assert [item.case_id for item in bundle.observations] == ["case_1", "case_2"]
+    assert all(item.judge is not None for item in bundle.observations)
+    assert calls[0]["model_snapshot"] is calls[1]["model_snapshot"]
+    assert all(call["user_id"] == "evaluation-user" for call in calls)
+
+
 def test_rag_source_fingerprint_is_stable_and_content_addressed():
     first = rag_source_fingerprint(".")
     second = rag_source_fingerprint(".")
@@ -450,15 +514,21 @@ def test_live_profile_uses_catalog_snapshot_as_effective_index(monkeypatch):
             model="embedding",
             revision="rev-1",
             device="cpu",
+            backend="sentence_transformers",
+            sparse_mode="bm25",
+            query_max_tokens=128,
+            document_max_tokens=512,
             dimension=1024,
             cache_namespace="docs",
         ),
         rerank=SimpleNamespace(
             enabled=False,
+            backend="http",
             model="",
             binding_host="",
             timeout_seconds=5.0,
             min_score=0.0,
+            effective_min_score=0.0,
             candidate_limit=20,
             max_document_characters=4000,
             max_total_characters=20000,

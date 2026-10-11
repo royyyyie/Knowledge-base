@@ -22,6 +22,7 @@ RAG Module 仍以同步 LangGraph 节点和同步 `PostgresSaver` 运行。持�
 5. Rerank 的条件跳过、输入上限、fallback 和 trace metadata 仍由 RAG Module 拥有。Provider Adapter 只负责可靠评分；失败保留召回排序，且不得应用 rerank score 阈值。
 6. FastAPI lifespan 在 Run executor 之前启动 Provider Runtime，并在所有 Run 停止后关闭它。模块导入不得加载模型、启动线程或创建 AsyncClient。
 7. Document 的 Milvus、解析、文件校验、PostgreSQL/Redis 和向量写入全部由持久 indexing worker 执行；HTTP Adapter 只提交 durable Index Job。
+8. 可选 `bge_m3` Embedding backend 在同一个受生命周期管理的本地模型上输出 Dense、模型词项权重与 ColBERT token 向量。Sparse 与 Dense 同次编码后写入独立的模型 Sparse collection；ColBERT 只复用已有 Rerank Stage 的有界候选、deadline、取消、阈值与显式降级，不建立第二套检索或 Rerank 流水线。默认 SentenceTransformer Dense + Milvus BM25 + 可选 HTTP Rerank 不变。
 
 ## 不变量
 
@@ -34,6 +35,7 @@ RAG Module 仍以同步 LangGraph 节点和同步 `PostgresSaver` 运行。持�
 - Rerank malformed response、重复/越界 index、缺失或非有限 score 都是 typed Provider failure，不能表现为健康空检索。
 - `ProviderLoopBridge` Adapter 在 running event loop 中必须 fail fast，不能通过阻塞等待制造死锁。
 - 当前同步 checkpoint 图、`Command(resume=...)` 和已接受的 HITL 语义保持不变。
+- 模型 Sparse 与 BM25 使用不同的 collection schema 和索引分数语义；不得原地把 BM25 Function 输出字段改为模型词项权重。M3 索引缺失或形状错误是 Provider failure，不能借能力降级静默回到 Dense。
 
 ## 后续异步图迁移条件
 

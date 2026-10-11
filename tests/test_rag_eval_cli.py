@@ -14,6 +14,7 @@ DATASET = ROOT / "evals/rag/rag_smoke_v1.json"
 OBSERVATIONS = ROOT / "evals/rag/offline_smoke_observations_v1.json"
 GATES = ROOT / "evals/rag/gates_v1.json"
 LIVE_GATES = ROOT / "evals/rag/live_gates_v1.json"
+JUDGED_LIVE_GATES = ROOT / "evals/rag/judged_live_gates_v1.json"
 BASELINE = ROOT / "evals/rag/baseline_v1.json"
 
 
@@ -123,6 +124,7 @@ def test_cli_returns_two_for_source_fingerprint_mismatch(tmp_path):
     )
 
     assert override_exit == 0
+    assert json.loads(report.read_text(encoding="utf-8"))["passed"] is False
     assert (
         json.loads(report.read_text(encoding="utf-8"))["metadata"][
             "source_mismatch_override"
@@ -249,11 +251,13 @@ def test_live_cli_pins_adapter_to_requested_index(monkeypatch, tmp_path):
             timeout_seconds,
             user_id,
             expected_index_id,
+            judge_answers,
         ):
             captured.update(
                 timeout_seconds=timeout_seconds,
                 user_id=user_id,
                 expected_index_id=expected_index_id,
+                judge_answers=judge_answers,
             )
 
         def execute(self, dataset):
@@ -305,4 +309,96 @@ def test_live_cli_pins_adapter_to_requested_index(monkeypatch, tmp_path):
         "timeout_seconds": 45.0,
         "user_id": "release-eval",
         "expected_index_id": "catalog-index-v2",
+        "judge_answers": False,
     }
+
+
+def test_live_cli_judged_mode_requires_answer_quality_gates(tmp_path):
+    exit_code = main(
+        [
+            "run",
+            "--dataset",
+            str(DATASET),
+            "--observations",
+            str(tmp_path / "observations.json"),
+            "--gates",
+            str(LIVE_GATES),
+            "--report",
+            str(tmp_path / "report.json"),
+            "--profile-id",
+            "release-profile",
+            "--index-id",
+            "catalog-index-v2",
+            "--judge-answers",
+        ]
+    )
+
+    assert exit_code == 2
+    assert not (tmp_path / "observations.json").exists()
+
+
+def test_live_cli_judged_mode_reports_complete_answer_coverage(monkeypatch, tmp_path):
+    from backend.evaluation.rag import RagJudgeMetrics
+
+    captured = {}
+
+    class FakeLiveAdapter:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+        def execute(self, dataset):
+            bundle = PredictionFileAdapter(OBSERVATIONS).execute(dataset)
+            judge = RagJudgeMetrics(
+                answer_correctness=0.9,
+                groundedness=0.9,
+                answer_relevance=0.9,
+                completeness=0.9,
+                context_relevance=0.9,
+                unsupported_claim_rate=0.1,
+                conflict_disclosure_rate=0.9,
+            )
+            return bundle.model_copy(
+                update={
+                    "observations": tuple(
+                        item.model_copy(update={"judge": judge})
+                        for item in bundle.observations
+                    )
+                }
+            )
+
+    monkeypatch.setattr("scripts.evaluate_rag.LiveRagEvalAdapter", FakeLiveAdapter)
+    monkeypatch.setattr(
+        "scripts.evaluate_rag._metadata",
+        lambda **_kwargs: {
+            "adapter": "live_rag",
+            "provenance": "live_rag",
+            "evaluation_mode": "answer_judge",
+        },
+    )
+
+    report_path = tmp_path / "report.json"
+    exit_code = main(
+        [
+            "run",
+            "--dataset",
+            str(DATASET),
+            "--observations",
+            str(tmp_path / "observations.json"),
+            "--gates",
+            str(JUDGED_LIVE_GATES),
+            "--report",
+            str(report_path),
+            "--profile-id",
+            "release-profile",
+            "--index-id",
+            "catalog-index-v2",
+            "--judge-answers",
+            "--fail-on-regression",
+        ]
+    )
+
+    assert exit_code == 0
+    assert captured["judge_answers"] is True
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    assert report["metrics"]["judge_coverage_rate"]["value"] == 1
+    assert report["metadata"]["evaluation_mode"] == "answer_judge"

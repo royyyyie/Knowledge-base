@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import timedelta
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -123,6 +124,12 @@ def test_dataset_job_case_and_report_are_persisted_behind_one_interface():
             if gate.metric == "case_pass_rate"
         )
         assert case_pass_gate.minimum == 0.95
+        judge_coverage_gate = next(
+            gate
+            for gate in job.gate_policy.metric_gates
+            if gate.metric == "judge_coverage_rate"
+        )
+        assert judge_coverage_gate.minimum == 1.0
         assert job.model_catalog_hash == TEST_MODEL_SNAPSHOT.catalog_hash
         assert set(job.model_snapshot.assignments) == set(
             TEST_MODEL_SNAPSHOT.assignments
@@ -373,6 +380,45 @@ def test_worker_runs_answer_judge_and_report_to_completion():
         engine.dispose()
 
 
+class _MissingJudgeRuntime(_SuccessfulRuntime):
+    def execute_case(self, *, case, **kwargs):
+        execution = super().execute_case(case=case, **kwargs)
+        return replace(
+            execution,
+            observation=execution.observation.model_copy(update={"judge": None}),
+            judge=None,
+            judge_reason=None,
+        )
+
+
+def test_default_job_gate_rejects_successful_execution_without_answer_judge():
+    engine, _, repository, service = _environment()
+    try:
+        dataset = service.create_dataset(username="admin", dataset=_dataset())
+        job = service.create_job(username="admin", dataset_id=dataset.id)
+        worker = RagEvaluationWorker(
+            repository=repository,
+            runtime=_MissingJudgeRuntime(),
+            settings=_settings(),
+            worker_id="evaluation-worker-no-judge",
+        )
+
+        assert worker.run_once() is True
+
+        completed = service.get_job(job.id)
+        assert completed.status is RagEvaluationJobStatus.SUCCEEDED
+        assert completed.report is not None
+        assert completed.report.metrics["case_pass_rate"].value == 1
+        assert completed.report.metrics["judge_coverage_rate"].value == 0
+        assert completed.report.passed is False
+        assert any(
+            gate.metric == "judge_coverage_rate" and gate.status.value == "failed"
+            for gate in completed.report.gates
+        )
+    finally:
+        engine.dispose()
+
+
 class _CrashAfterFirstRuntime(_SuccessfulRuntime):
     def __init__(self):
         self.calls = 0
@@ -382,6 +428,45 @@ class _CrashAfterFirstRuntime(_SuccessfulRuntime):
         if self.calls == 2:
             raise RuntimeError("simulated worker crash")
         return super().execute_case(case=case, **kwargs)
+
+
+class _ChangingIndexRuntime(_SuccessfulRuntime):
+    def __init__(self):
+        self.calls = 0
+
+    def execute_case(self, *, case, **kwargs):
+        self.calls += 1
+        execution = super().execute_case(case=case, **kwargs)
+        return replace(
+            execution,
+            observation=execution.observation.model_copy(
+                update={"retrieval_index_ids": (f"index-v{self.calls}",)}
+            ),
+        )
+
+
+def test_worker_fails_when_document_index_changes_between_cases():
+    engine, _, repository, service = _environment()
+    try:
+        dataset = service.create_dataset(username="admin", dataset=_two_case_dataset())
+        job = service.create_job(username="admin", dataset_id=dataset.id)
+        worker = RagEvaluationWorker(
+            repository=repository,
+            runtime=_ChangingIndexRuntime(),
+            settings=_settings(),
+            worker_id="evaluation-worker-index-drift",
+        )
+
+        assert worker.run_once() is True
+
+        failed = service.get_job(job.id)
+        assert failed.status is RagEvaluationJobStatus.FAILED
+        assert failed.completed_cases == 1
+        assert failed.report is not None
+        assert failed.report.metadata["retrieval_index_ids"] == ["index-v1"]
+        assert failed.report.passed is False
+    finally:
+        engine.dispose()
 
 
 def test_worker_failure_persists_partial_report_and_completed_case_metrics():

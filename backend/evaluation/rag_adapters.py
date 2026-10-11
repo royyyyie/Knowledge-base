@@ -26,7 +26,7 @@ from backend.evaluation.rag import (
 )
 
 
-RAG_SOURCE_FINGERPRINT_VERSION = "1"
+RAG_SOURCE_FINGERPRINT_VERSION = "2"
 
 
 class RagEvalExecutionError(RuntimeError):
@@ -69,6 +69,7 @@ class LiveRagEvalAdapter:
         timeout_seconds: float = 60.0,
         user_id: str = "rag_eval",
         expected_index_id: str | None = None,
+        judge_answers: bool = False,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
         if timeout_seconds <= 0 or not math.isfinite(timeout_seconds):
@@ -80,6 +81,7 @@ class LiveRagEvalAdapter:
         )
         if self.expected_index_id == "":
             raise ValueError("expected_index_id must not be empty")
+        self.judge_answers = bool(judge_answers)
         self._clock = clock
 
     def execute(self, dataset: RagEvalDataset) -> RagEvalObservationBundle:
@@ -93,6 +95,13 @@ class LiveRagEvalAdapter:
         from backend.providers.runtime import provider_runtime
         from backend.rag.pipeline import resume_rag_from_hitl, run_rag_graph
 
+        if self.judge_answers:
+            from backend.evaluation.runtime import RagEvaluationRuntime
+
+            evaluation_runtime = RagEvaluationRuntime()
+        else:
+            evaluation_runtime = None
+
         if provider_runtime.readiness().running:
             raise RagEvalExecutionError(
                 "live RAG evaluation requires a dedicated process"
@@ -100,6 +109,7 @@ class LiveRagEvalAdapter:
 
         observations: list[RagEvalObservation] = []
         observed_index_id = self.expected_index_id
+        model_snapshot = model_registry.environment_snapshot()
         try:
             provider_runtime.start_sync()
         except BaseExceptionGroup as exc:
@@ -114,28 +124,49 @@ class LiveRagEvalAdapter:
         try:
             for case in dataset.cases:
                 started_at = self._clock()
-                ctx = RunRequestContext.for_sync(
-                    user_id=self.user_id,
-                    thread_id=f"rag_eval_{case.id}",
-                    model_snapshot=model_registry.environment_snapshot(),
-                    tenant_id=get_settings().app.default_tenant_id,
-                )
-                ctx.configure_provider_runtime(
-                    deadline_at=started_at + self.timeout_seconds,
-                )
+                ctx = None
                 try:
-                    initial = run_rag_graph(case.question, ctx)
-                    final = initial
-                    for answer in case.hitl_answers:
-                        resume_state = final.get("hitl_resume_state")
-                        if not isinstance(resume_state, dict):
-                            break
-                        final = resume_rag_from_hitl(
-                            resume_state,
-                            answer,
-                            ctx,
+                    if evaluation_runtime is not None:
+                        execution = evaluation_runtime.execute_case(
+                            job_id="rag_eval_cli",
+                            case=case,
+                            model_snapshot=model_snapshot,
+                            timeout_seconds=self.timeout_seconds,
+                            cancellation=lambda: False,
+                            user_id=self.user_id,
                         )
-                    case_index_ids = _retrieval_index_ids(initial, final)
+                        case_index_ids = set(execution.observation.retrieval_index_ids)
+                        observation = execution.observation
+                    else:
+                        ctx = RunRequestContext.for_sync(
+                            user_id=self.user_id,
+                            thread_id=f"rag_eval_{case.id}",
+                            model_snapshot=model_snapshot,
+                            tenant_id=get_settings().app.default_tenant_id,
+                        )
+                        ctx.configure_provider_runtime(
+                            deadline_at=started_at + self.timeout_seconds,
+                        )
+                        initial = run_rag_graph(case.question, ctx)
+                        final = initial
+                        for answer in case.hitl_answers:
+                            resume_state = final.get("hitl_resume_state")
+                            if not isinstance(resume_state, dict):
+                                break
+                            final = resume_rag_from_hitl(
+                                resume_state,
+                                answer,
+                                ctx,
+                            )
+                        case_index_ids = retrieval_index_ids_from_rag_results(
+                            initial, final
+                        )
+                        observation = observation_from_rag_results(
+                            case,
+                            initial=initial,
+                            final=final,
+                            duration_ms=(self._clock() - started_at) * 1000,
+                        )
                     if len(case_index_ids) > 1:
                         raise RagEvalExecutionError(
                             f"live RAG evaluation mixed document indexes in case {case.id}"
@@ -148,14 +179,7 @@ class LiveRagEvalAdapter:
                             raise RagEvalExecutionError(
                                 "live RAG evaluation document index changed during execution"
                             )
-                    observations.append(
-                        observation_from_rag_results(
-                            case,
-                            initial=initial,
-                            final=final,
-                            duration_ms=(self._clock() - started_at) * 1000,
-                        )
-                    )
+                    observations.append(observation)
                 except ProviderError as exc:
                     observations.append(
                         RagEvalObservation(
@@ -177,7 +201,8 @@ class LiveRagEvalAdapter:
                         f"live RAG evaluation failed for case {case.id}"
                     ) from exc
                 finally:
-                    ctx.close()
+                    if ctx is not None:
+                        ctx.close()
         except BaseException as exc:
             primary_error = exc
             raise
@@ -258,6 +283,9 @@ def observation_from_rag_results(
             RagProviderErrorStage.RETRIEVAL if provider_error_code is not None else None
         ),
         duration_ms=max(float(duration_ms), 0.0),
+        retrieval_index_ids=tuple(
+            sorted(retrieval_index_ids_from_rag_results(initial, final))
+        ),
         retrieved_chunks=final_chunks,
         initial_retrieved_chunks=_chunks_from_trace(
             initial,
@@ -283,7 +311,11 @@ def rag_source_fingerprint(root: str | Path) -> str:
 
     root_path = Path(root)
     relative_paths = (
+        "backend/agent/models.py",
         "backend/core/settings.py",
+        "backend/evaluation/rag.py",
+        "backend/evaluation/rag_adapters.py",
+        "backend/evaluation/runtime.py",
         "backend/runs/request_context.py",
         "backend/documents/catalog.py",
         "backend/documents/publication.py",
@@ -397,6 +429,10 @@ def live_rag_profile_snapshot(*, profile_id: str, index_id: str) -> dict[str, An
             "model": settings.embedding.model,
             "revision": settings.embedding.revision,
             "device": settings.embedding.device,
+            "backend": settings.embedding.backend,
+            "sparse_mode": settings.embedding.sparse_mode,
+            "query_max_tokens": settings.embedding.query_max_tokens,
+            "document_max_tokens": settings.embedding.document_max_tokens,
             "dimension": settings.embedding.dimension,
             "cache_namespace": settings.embedding.cache_namespace,
         },
@@ -417,10 +453,19 @@ def live_rag_profile_snapshot(*, profile_id: str, index_id: str) -> dict[str, An
         },
         "rerank": {
             "enabled": settings.rerank.enabled,
-            "model": settings.rerank.model,
-            "provider_endpoint_sha256": _identity_hash(settings.rerank.binding_host),
+            "backend": settings.rerank.backend,
+            "model": (
+                f"{settings.embedding.model}@{settings.embedding.revision}:colbert"
+                if settings.rerank.backend == "colbert"
+                else settings.rerank.model
+            ),
+            "provider_endpoint_sha256": (
+                _identity_hash(settings.rerank.binding_host)
+                if settings.rerank.backend == "http"
+                else None
+            ),
             "timeout_seconds": settings.rerank.timeout_seconds,
-            "min_score": settings.rerank.min_score,
+            "min_score": settings.rerank.effective_min_score,
             "candidate_limit": settings.rerank.candidate_limit,
             "max_document_characters": settings.rerank.max_document_characters,
             "max_total_characters": settings.rerank.max_total_characters,
@@ -447,7 +492,7 @@ def _sub_traces(trace: Mapping[str, Any]) -> tuple[dict[str, Any], ...]:
     return tuple(dict(item) for item in value if isinstance(item, Mapping))
 
 
-def _retrieval_index_ids(*results: Mapping[str, Any]) -> set[str]:
+def retrieval_index_ids_from_rag_results(*results: Mapping[str, Any]) -> set[str]:
     identities: set[str] = set()
 
     def _collect(trace: Mapping[str, Any]) -> None:
@@ -652,4 +697,5 @@ __all__ = [
     "live_rag_profile_snapshot",
     "profile_fingerprint",
     "rag_source_fingerprint",
+    "retrieval_index_ids_from_rag_results",
 ]

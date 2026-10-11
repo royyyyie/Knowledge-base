@@ -1,3 +1,4 @@
+import importlib
 import importlib.util
 import os
 import sys
@@ -65,6 +66,8 @@ class FakeRerankStage:
 
 
 def load_utils(env):
+    # Do not first-load extension modules while patch.dict(sys.modules) can erase them.
+    importlib.import_module("backend.agent.models")
     embedding_service = FakeEmbeddingService()
     milvus_store = FakeMilvusStore()
 
@@ -240,7 +243,8 @@ class RagLatencyGuardTests(unittest.TestCase):
                 self.payload = payload
                 self.schema = None
 
-            def with_structured_output(self, schema):
+            def with_structured_output(self, schema, *, method):
+                assert method == "json_mode"
                 self.schema = schema
                 return self
 

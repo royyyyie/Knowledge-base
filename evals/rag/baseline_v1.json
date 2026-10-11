@@ -1470,11 +1470,13 @@
     "adapter": "prediction_file",
     "corpus_fingerprint": "10b8700eb5a67e683676270fe19b1cf282a9a48668744273e025d420e7e2bd87",
     "corpus_id": "orion_controlled_rag_smoke_v1",
+    "evaluation_mode": "retrieval",
+    "gate_policy_fingerprint": "09f35f1c4e17a66afc5f2e571151cc46659eeb1e6f04b0075305272694dcb276",
     "index_id": "controlled-corpus-v1",
     "profile_fingerprint": "3c28851ecfd9c4c3a67b33cb442deea05ae8e513599d77214a5d9907ba392291",
     "profile_id": "offline-smoke-v1",
     "provenance": "contract_smoke",
-    "rag_source_fingerprint": "28741025b746620adb0324dfd9e9c484102244f833a542bce37f82d09b08d7f8",
+    "rag_source_fingerprint": "5376a19e6fa2c1a6bcabef9f70a5235232d3359ee9424099e6cecac39c315e4c",
     "source_mismatch_override": false
   },
   "metrics": {
@@ -1561,6 +1563,10 @@
     "hitl_resolution_success_rate": {
       "eligible_cases": 2,
       "value": 1.0
+    },
+    "judge_coverage_rate": {
+      "eligible_cases": 20,
+      "value": 0.0
     },
     "judge_provider_failure_rate": {
       "eligible_cases": 20,
@@ -1774,6 +1780,10 @@
           "eligible_cases": 2,
           "value": 1.0
         },
+        "judge_coverage_rate": {
+          "eligible_cases": 2,
+          "value": 0.0
+        },
         "judge_provider_failure_rate": {
           "eligible_cases": 2,
           "value": 0.0
@@ -1982,6 +1992,10 @@
         "hitl_resolution_success_rate": {
           "eligible_cases": 0,
           "value": null
+        },
+        "judge_coverage_rate": {
+          "eligible_cases": 1,
+          "value": 0.0
         },
         "judge_provider_failure_rate": {
           "eligible_cases": 1,
@@ -2192,6 +2206,10 @@
           "eligible_cases": 0,
           "value": null
         },
+        "judge_coverage_rate": {
+          "eligible_cases": 1,
+          "value": 0.0
+        },
         "judge_provider_failure_rate": {
           "eligible_cases": 1,
           "value": 0.0
@@ -2400,6 +2418,10 @@
         "hitl_resolution_success_rate": {
           "eligible_cases": 0,
           "value": null
+        },
+        "judge_coverage_rate": {
+          "eligible_cases": 2,
+          "value": 0.0
         },
         "judge_provider_failure_rate": {
           "eligible_cases": 2,
@@ -2610,6 +2632,10 @@
           "eligible_cases": 0,
           "value": null
         },
+        "judge_coverage_rate": {
+          "eligible_cases": 1,
+          "value": 0.0
+        },
         "judge_provider_failure_rate": {
           "eligible_cases": 1,
           "value": 0.0
@@ -2818,6 +2844,10 @@
         "hitl_resolution_success_rate": {
           "eligible_cases": 0,
           "value": null
+        },
+        "judge_coverage_rate": {
+          "eligible_cases": 1,
+          "value": 0.0
         },
         "judge_provider_failure_rate": {
           "eligible_cases": 1,
@@ -3028,6 +3058,10 @@
           "eligible_cases": 0,
           "value": null
         },
+        "judge_coverage_rate": {
+          "eligible_cases": 2,
+          "value": 0.0
+        },
         "judge_provider_failure_rate": {
           "eligible_cases": 2,
           "value": 0.0
@@ -3236,6 +3270,10 @@
         "hitl_resolution_success_rate": {
           "eligible_cases": 0,
           "value": null
+        },
+        "judge_coverage_rate": {
+          "eligible_cases": 2,
+          "value": 0.0
         },
         "judge_provider_failure_rate": {
           "eligible_cases": 2,
@@ -3446,6 +3484,10 @@
           "eligible_cases": 2,
           "value": 1.0
         },
+        "judge_coverage_rate": {
+          "eligible_cases": 2,
+          "value": 0.0
+        },
         "judge_provider_failure_rate": {
           "eligible_cases": 2,
           "value": 0.0
@@ -3654,6 +3696,10 @@
         "hitl_resolution_success_rate": {
           "eligible_cases": 0,
           "value": null
+        },
+        "judge_coverage_rate": {
+          "eligible_cases": 2,
+          "value": 0.0
         },
         "judge_provider_failure_rate": {
           "eligible_cases": 2,
@@ -3864,6 +3910,10 @@
           "eligible_cases": 0,
           "value": null
         },
+        "judge_coverage_rate": {
+          "eligible_cases": 4,
+          "value": 0.0
+        },
         "judge_provider_failure_rate": {
           "eligible_cases": 4,
           "value": 0.0
@@ -4072,6 +4122,10 @@
         "hitl_resolution_success_rate": {
           "eligible_cases": 0,
           "value": null
+        },
+        "judge_coverage_rate": {
+          "eligible_cases": 1,
+          "value": 0.0
         },
         "judge_provider_failure_rate": {
           "eligible_cases": 1,
@@ -4282,6 +4336,10 @@
           "eligible_cases": 0,
           "value": null
         },
+        "judge_coverage_rate": {
+          "eligible_cases": 1,
+          "value": 0.0
+        },
         "judge_provider_failure_rate": {
           "eligible_cases": 1,
           "value": 0.0
@@ -4490,6 +4548,10 @@
         "hitl_resolution_success_rate": {
           "eligible_cases": 0,
           "value": null
+        },
+        "judge_coverage_rate": {
+          "eligible_cases": 1,
+          "value": 0.0
         },
         "judge_provider_failure_rate": {
           "eligible_cases": 1,
@@ -4700,6 +4762,10 @@
           "eligible_cases": 0,
           "value": null
         },
+        "judge_coverage_rate": {
+          "eligible_cases": 1,
+          "value": 0.0
+        },
         "judge_provider_failure_rate": {
           "eligible_cases": 1,
           "value": 0.0
@@ -4908,6 +4974,10 @@
         "hitl_resolution_success_rate": {
           "eligible_cases": 0,
           "value": null
+        },
+        "judge_coverage_rate": {
+          "eligible_cases": 1,
+          "value": 0.0
         },
         "judge_provider_failure_rate": {
           "eligible_cases": 1,
@@ -5118,6 +5188,10 @@
           "eligible_cases": 0,
           "value": null
         },
+        "judge_coverage_rate": {
+          "eligible_cases": 3,
+          "value": 0.0
+        },
         "judge_provider_failure_rate": {
           "eligible_cases": 3,
           "value": 0.0
@@ -5326,6 +5400,10 @@
         "hitl_resolution_success_rate": {
           "eligible_cases": 0,
           "value": null
+        },
+        "judge_coverage_rate": {
+          "eligible_cases": 1,
+          "value": 0.0
         },
         "judge_provider_failure_rate": {
           "eligible_cases": 1,
@@ -5536,6 +5614,10 @@
           "eligible_cases": 0,
           "value": null
         },
+        "judge_coverage_rate": {
+          "eligible_cases": 1,
+          "value": 0.0
+        },
         "judge_provider_failure_rate": {
           "eligible_cases": 1,
           "value": 0.0
@@ -5745,6 +5827,10 @@
           "eligible_cases": 1,
           "value": 1.0
         },
+        "judge_coverage_rate": {
+          "eligible_cases": 4,
+          "value": 0.0
+        },
         "judge_provider_failure_rate": {
           "eligible_cases": 4,
           "value": 0.0
@@ -5953,6 +6039,10 @@
         "hitl_resolution_success_rate": {
           "eligible_cases": 0,
           "value": null
+        },
+        "judge_coverage_rate": {
+          "eligible_cases": 1,
+          "value": 0.0
         },
         "judge_provider_failure_rate": {
           "eligible_cases": 1,

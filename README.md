@@ -166,6 +166,8 @@ cp .env.example .env
 
 `.env.example` 中的 PostgreSQL 与 Redis DSN 已与开发 Compose 默认值对齐。Rerank、Web
 Research、SQL Assistant 和 Sandbox 都是可选能力，默认关闭或允许明确降级。
+首次启动会按 `EMBEDDING_MODEL_REVISION` 下载并缓存本地 Embedding 模型；默认
+`HF_ENDPOINT` 使用 Hugging Face 官方源。若切换镜像，需确认镜像支持当前客户端所需的文件元数据。
 
 ### 2. 启动依赖并安装项目
 
@@ -562,6 +564,9 @@ npm run build
 5. Job 聚合 Case 指标、Gate 与 baseline delta，持久化 report；前端刷新后可继续查看进度和结果。
 6. 取消 Job 会停止领取后续 Case，并保留已完成 Case 的审计记录。
 
+Report 的 `judge_coverage_rate` 显示有多少 Case 实际得到 Evaluator 结果；选择答案质量门禁时应要求
+覆盖率为 100%。Evaluation Job 会拒绝同一 Job 的 Observation 混用不同检索索引身份。
+
 ### 5. Milvus 2.5+ 原生 BM25
 
 - Collection 定义 `FunctionType.BM25`，输入为启用中文 analyzer 的 `text`，输出为
@@ -571,6 +576,16 @@ npm run build
 - 查询时同时发起 Dense 与 Sparse `AnnSearchRequest`，再使用 `RRFRanker` 融合两路排名。
 - Document Version、Tenant、Knowledge Base 和 chunk level 过滤在安全构造的 Milvus filter 中
   同时生效，避免跨版本或跨作用域召回。
+
+可选 BGE-M3 多能力实验保留上述默认链路。安装 `uv sync --dev --locked --extra bge-m3`
+后，在隔离 Tenant 设置 `EMBEDDING_BACKEND=bge_m3`、`RAG_SPARSE_MODE=bge_m3`，
+由正式 Index Job 重新发布文档。该布局写入独立的 `_catalog_m3_v1` collection：
+同次模型推理产生 Dense 和模型词项权重，稀疏字段使用 IP 索引，不使用 Milvus BM25 Function。
+新版本的 build profile 记录后端、稀疏模式与截断长度；旧 `_catalog_v1` collection 不会原地改写。
+`RERANK_BACKEND=colbert` 可在同一 BGE-M3 Runtime 上对有界候选集进行逐词重排，
+与 HTTP Rerank 二选一。CPU 机器应先限制候选数、文档 token 数并测量 p95；
+Rerank 超时沿用现有显式回退和 trace。实验步骤见
+[BGE-M3 模式测评 Runbook](docs/runbooks/bge-m3-modes-evaluation.md)。
 
 ### 6. Thread 记忆链路
 
@@ -655,12 +670,16 @@ npm run build
 
 ## RAG 效果评测
 
-仓库保留了小型、版本化的 RAG Dataset、受控语料、离线 Observation、baseline 和质量 Gate。
+仓库保留了 20 条人工标注 smoke Dataset 及其受控语料、离线 Observation、baseline 和质量 Gate；另有 200 条受控合成基准集与独立语料，尚无可比较的 live baseline。
 这些资产属于产品功能和 CI 门禁，不是临时测试产物。
 
 ```bash
 uv run --frozen python scripts/evaluate_rag.py validate \
   --dataset evals/rag/rag_smoke_v1.json
+
+uv run --frozen python scripts/generate_rag_benchmark_v2.py --check
+uv run --frozen python scripts/evaluate_rag.py validate \
+  --dataset evals/rag/rag_benchmark_v2.json
 
 uv run --frozen python scripts/evaluate_rag.py score \
   --dataset evals/rag/rag_smoke_v1.json \
@@ -675,6 +694,18 @@ uv run --frozen python scripts/evaluate_rag.py score \
 真实 RAG 运行、profile/index fingerprint 和报告约束见
 [RAG 评测说明](evals/rag/README.md)。提交入库的 baseline 与 Dataset 不应被 `.gitignore`
 忽略；本地生成的报告统一写入 `.artifacts/`。
+[2026-09-14 真实模型测评说明](docs/rag-evaluation-assessment-2026-09-14.md)记录了受控语料、
+离线 baseline 与真实结果的不同口径、失败 Case 和复现条件。
+[200 条扩展基准集测评记录](docs/rag-benchmark-v2-assessment-2026-09-14.md)区分了模型服务
+HTTP 402 造成的 live 失败和 200 条无 LLM 检索专项结果。
+当前解析器会跳过只有标题的 HTML 章节，将完整标题路径写入每个分块，并把 HTML 表格行写成
+“列名=值”的可检索事实。新基准集的 30 份文档现生成 90 个三级 chunk；此前的 110 个 chunk
+及测评数值属于旧解析版本，不可直接作为新索引的质量结论。200 条中有不少由站点模板生成，
+不能代替业务专家盲审或真实生产分布。其隔离索引和完整运行命令见[RAG 评测说明](evals/rag/README.md)。
+真实 PDF、Word、Excel、HTML 评测语料可先用
+[`audit_rag_eval_corpus.py`](scripts/audit_rag_eval_corpus.py) 核对来源声明、文件哈希与
+各格式 gold Case 覆盖，再经正式 Index Job 和 live RAG 评测；流程见
+[跨格式评测 Runbook](docs/runbooks/cross-format-rag-evaluation.md)。资料审计不产生质量分数。
 
 需要连接当前模型、Milvus 和隔离测试索引进行真实评测时运行：
 
@@ -687,7 +718,25 @@ uv run --frozen python scripts/evaluate_rag.py run \
   --markdown .artifacts/rag-eval/live-report.md \
   --profile-id local-orion-eval-v1 \
   --index-id your-index-manifest-or-collection-version \
-  --timeout-seconds 60
+  --timeout-seconds 60 \
+  --fail-on-regression
+```
+
+上面的 `run` 默认只评测检索、路由和 HITL。要同时评测答案，使用同一个 Evaluation Runtime 的答案
+生成与 Evaluator Judge 路径，并要求所有 Case 都有 Judge 结果：
+
+```bash
+uv run --frozen python scripts/evaluate_rag.py run \
+  --dataset evals/rag/rag_smoke_v1.json \
+  --gates evals/rag/judged_live_gates_v1.json \
+  --observations .artifacts/rag-eval/judged-observations.json \
+  --report .artifacts/rag-eval/judged-report.json \
+  --markdown .artifacts/rag-eval/judged-report.md \
+  --profile-id local-orion-eval-v1 \
+  --index-id your-index-manifest-or-collection-version \
+  --timeout-seconds 60 \
+  --judge-answers \
+  --fail-on-regression
 ```
 
 两类评测不能混用：
@@ -695,7 +744,14 @@ uv run --frozen python scripts/evaluate_rag.py run \
 - offline smoke 用于验证 Dataset / Observation / Report 契约、指标计算和 baseline Gate 可复现性，
   provenance 为 `contract_smoke`，不代表生产检索质量。
 - live run 真实调用当前 RAG、Provider 和索引，provenance 为 `live_rag`；报告绑定 corpus、RAG 源码、
-  lockfile、模型、Embedding、Rerank 和检索配置的脱敏 fingerprint。
+  模型、Embedding、Rerank 和检索配置的脱敏 fingerprint。源码指纹不包含依赖锁文件；依赖升级若
+  改变 RAG 行为，必须提升源码指纹版本并重建 baseline。
+
+报告会明确标出答案 Judge 是未运行、部分运行还是全部运行。`judged_live_gates_v1.json` 当前要求
+100% Judge 覆盖、平均正确性和有据性至少 0.7、无证据声明比例至多 0.2；这些答案阈值需要用人工
+复核样本校准。这里生成的是 Evaluation Runtime 的受控答案，不能代替完整 Agent Run 的最终用户
+回答、引用解析或泄密检测。跨模型快照、索引、语料、Gate policy、评测模式或源码的 baseline 默认拒绝比较；
+`--allow-source-mismatch` 仅供调查，生成的 Report 不会通过发布门禁。
 
 报告与 Observation 不保存 chunk 正文、Provider endpoint、Secret 或原始异常。修改 Dataset 后
 fingerprint 会变化，旧 Observation 和 baseline 会被拒绝。生产门禁应逐步扩展到至少 200 条人工
@@ -716,7 +772,8 @@ Case，并由独立 worker 执行。CLI 更适合仓库 Gate、分支比较与�
   BM25 Function、RRF、Auto-merging。
 - **Embedding 与 Rerank**：`langchain_huggingface` 本地 Embedding，默认固定 revision 的
   `BAAI/bge-m3`；可选 Jina-compatible Rerank Provider。
-- **文档解析**：PyPDF、docx2txt、Unstructured、openpyxl、msoffcrypto-tool 和多级递归分块。
+- **文档解析**：pdfplumber、pypdfium2、python-docx、openpyxl 与结构化三级分块；
+  扫描 PDF 可选本地 Tesseract OCR，旧版 Office 可选 LibreOffice 转换。
 - **前端**：Vite、Vue 3 SFC、TypeScript、Pinia、Axios、Marked、DOMPurify、Highlight.js、
   FontAwesome 与 Sass。
 - **质量工具**：pytest、pytest-asyncio、Ruff、mypy、Vitest、ESLint、Prettier、vue-tsc、
@@ -732,7 +789,8 @@ Case，并由独立 worker 执行。CLI 更适合仓库 Gate、分支比较与�
 ### 模型与 RAG
 
 - `ARK_API_KEY`、`BASE_URL`、`MODEL`、`FAST_MODEL`、`GRADE_MODEL`、`EVALUATION_MODEL`：模型
-  Secret 与首次控制面种子。
+  Secret 与首次控制面种子。Fast、Grader、Evaluator 的服务端点需支持 OpenAI 兼容的
+  `response_format=json_object`；结构化调用使用 JSON 模式并由本地 schema 验证。
 - `MODEL_TIMEOUT_SECONDS`：模型单次请求上限；SDK 内建重试关闭，由 Provider policy 统一控制。
 - `RETRIEVAL_TOP_K`、`RETRIEVAL_CANDIDATE_K`、`RETRIEVAL_CANDIDATE_MULTIPLIER`：最终片段数与
   叶子层候选池。
@@ -746,6 +804,9 @@ Case，并由独立 worker 执行。CLI 更适合仓库 Gate、分支比较与�
 
 - `EMBEDDING_MODEL`、`EMBEDDING_MODEL_REVISION`、`EMBEDDING_DEVICE`、
   `DENSE_EMBEDDING_DIM`：本地 Dense 模型与 Milvus schema 身份。
+- `EMBEDDING_BACKEND`、`RAG_SPARSE_MODE`、`M3_QUERY_MAX_TOKENS`、
+  `M3_DOCUMENT_MAX_TOKENS`：可选 BGE-M3 Dense/Sparse/ColBERT 模式与输入预算；
+  改动索引模式或文档截断长度后须重新发布 Document Version。
 - `EMBEDDING_TIMEOUT_SECONDS`、`EMBEDDING_EXECUTOR_WORKERS`、`EMBEDDING_MAX_CONCURRENCY`：
   Embedding 执行与并发预算。
 - `EMBEDDING_QUERY_MICROBATCH_MS`、`EMBEDDING_QUERY_MAX_BATCH_SIZE`、
@@ -753,6 +814,8 @@ Case，并由独立 worker 执行。CLI 更适合仓库 Gate、分支比较与�
   micro-batch、队列和缓存。
 - `RERANK_MODEL`、`RERANK_BINDING_HOST`、`RERANK_API_KEY`：可选 Rerank Provider；占位符会被
   识别为未启用。
+- `RERANK_BACKEND=colbert`：使用同一 BGE-M3 本地模型重排，不需要远端 Rerank 凭据；
+  `COLBERT_MIN_SCORE` 是独立的候选过滤阈值，默认 `-1`，避免套用远端模型的分数标度。
 - `RERANK_TIMEOUT_SECONDS`、并发/连接池、候选数、单文档字符、总字符、熔断阈值和 reset 时间：
   共同限制精排对端到端时延和内存的影响。
 - `RERANK_MIN_SCORE`：Rerank 后 Evidence 的最低分，需要基于固定 Dataset 标定。
@@ -764,10 +827,22 @@ Case，并由独立 worker 执行。CLI 更适合仓库 Gate、分支比较与�
 - `UPLOAD_DIR`：source object 持久目录；API 与索引 worker 必须指向同一位置。
 - `MAX_UPLOAD_BYTES`、`MAX_DOCUMENT_PAGES`、`MAX_PAGE_CHARACTERS`、`PARSER_TIMEOUT_SECONDS`：
   单文件与解析预算。
+- `MAX_WORKBOOK_ROWS`、`MAX_WORKBOOK_CELLS`：Excel 单工作表行数及整个工作簿的单元格预算。
 - `MAX_ARCHIVE_ENTRIES`、`MAX_UNCOMPRESSED_BYTES`、`MAX_COMPRESSION_RATIO`：压缩包防护。
 - `DEFAULT_TENANT_ID`、`DEFAULT_KNOWLEDGE_BASE_NAME`、`DOCUMENT_PARSER_VERSION`、
   `DOCUMENT_CHUNKER_VERSION`、`DOCUMENT_INDEX_VERSION`：Document build fingerprint；API 与索引
-  worker 必须一致。
+  worker 必须一致。PDF/Word/Excel 结构化解析升级使用 `document-loader-v4` /
+  `three-level-800-100-v4`；已发布的旧 Document Version 保持原内容，需重新上传或
+  重建版本后才会采用新分块。
+
+PDF 按页提取可复制文本和表格行，表格行保留列名与值；无可提取文本的页面改用本地
+Tesseract OCR。OCR 需要 worker 安装 `tesseract` 及 `chi_sim`、`eng` 语言数据；缺失或识别
+置信度不足会使候选 Index Job 明确失败，不发布空索引。Word `.docx` 保留标题路径、列表与
+表格行；Excel `.xlsx` 按可见工作表生成带单元格范围的行事实，公式无缓存结果时标记
+“公式结果不可用”，不计算公式。旧版 `.doc/.xls` 需要 worker 上的 `soffice` 转换为 OOXML。
+PDF 页码/区域、Word 块序号和 Excel 工作表/行范围保存在现有 `section_id` 来源元数据中，
+检索 Evidence 会显示这些位置。复杂扫描表格仍以 OCR 文本入库，不能保证表格列关系；
+上线前应使用本组织样本单独验证。部署检查见 `docs/runbooks/persistent-indexing-worker.md`。
 
 ### Worker、Run 与 Agent
 

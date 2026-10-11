@@ -18,14 +18,15 @@ from backend.evaluation.rag import (  # noqa: E402
     MetricDirection,
     RagEvalGatePolicy,
     RagEvalObservationBundle,
-    RagEvalReport,
     RagEvaluationError,
     evaluate_rag,
+    gate_policy_fingerprint,
     load_rag_eval_dataset,
     load_rag_eval_gates,
     load_rag_eval_report,
     render_rag_eval_json,
     render_rag_eval_markdown,
+    require_comparable_baseline,
 )
 from backend.evaluation.rag_adapters import (  # noqa: E402
     LiveRagEvalAdapter,
@@ -62,6 +63,11 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--observations", required=True, type=Path)
     run.add_argument("--timeout-seconds", type=_positive_finite, default=60.0)
     run.add_argument("--user-id", default="rag_eval")
+    run.add_argument(
+        "--judge-answers",
+        action="store_true",
+        help="also generate an evaluation answer and score it with the Evaluator",
+    )
     return parser
 
 
@@ -128,6 +134,8 @@ def main(argv: list[str] | None = None) -> int:
         dataset = load_rag_eval_dataset(args.dataset)
         gates = load_rag_eval_gates(args.gates)
         _validate_release_policy(gates)
+        if args.command == "run" and args.judge_answers:
+            _validate_judged_release_policy(gates)
         baseline = load_rag_eval_report(args.baseline) if args.baseline else None
         corpus_id = args.corpus_id or dataset.name
         metadata = _metadata(
@@ -139,15 +147,18 @@ def main(argv: list[str] | None = None) -> int:
             source_mismatch_override=bool(
                 baseline is not None and args.allow_source_mismatch
             ),
+            judge_answers=bool(args.command == "run" and args.judge_answers),
+            gates=gates,
         )
-        if baseline is not None and not args.allow_source_mismatch:
-            _require_comparable_source(metadata, baseline)
+        if baseline is not None:
+            require_comparable_baseline(metadata, baseline)
 
         if args.command == "run":
             bundle = LiveRagEvalAdapter(
                 timeout_seconds=args.timeout_seconds,
                 user_id=args.user_id,
                 expected_index_id=args.index_id,
+                judge_answers=args.judge_answers,
             ).execute(dataset)
             _write_observations(args.observations, bundle)
         else:
@@ -200,6 +211,8 @@ def _metadata(
     profile_id: str,
     index_id: str,
     source_mismatch_override: bool,
+    judge_answers: bool = False,
+    gates: RagEvalGatePolicy,
 ) -> dict[str, Any]:
     if live:
         from backend.env import load_env
@@ -222,6 +235,8 @@ def _metadata(
     return {
         "adapter": adapter,
         "provenance": provenance,
+        "evaluation_mode": "answer_judge" if judge_answers else "retrieval",
+        "gate_policy_fingerprint": gate_policy_fingerprint(gates),
         "corpus_id": corpus_id,
         "corpus_fingerprint": artifact_tree_fingerprint(corpus_path),
         "profile_id": profile_id,
@@ -230,28 +245,6 @@ def _metadata(
         "rag_source_fingerprint": rag_source_fingerprint(PROJECT_ROOT),
         "source_mismatch_override": source_mismatch_override,
     }
-
-
-def _require_comparable_source(
-    metadata: dict[str, Any],
-    baseline: RagEvalReport,
-) -> None:
-    mismatches = [
-        key
-        for key in (
-            "corpus_id",
-            "corpus_fingerprint",
-            "profile_id",
-            "index_id",
-            "profile_fingerprint",
-            "rag_source_fingerprint",
-        )
-        if baseline.metadata.get(key) != metadata.get(key)
-    ]
-    if mismatches:
-        raise DatasetFingerprintMismatch(
-            "baseline source identity differs: " + ", ".join(mismatches)
-        )
 
 
 def _validate_release_policy(policy: RagEvalGatePolicy) -> None:
@@ -353,6 +346,33 @@ def _validate_release_policy(policy: RagEvalGatePolicy) -> None:
         if gate.max_regression > max_regression:
             raise RagEvaluationError(
                 f"release metric regression tolerance is weak: {metric}"
+            )
+
+
+def _validate_judged_release_policy(policy: RagEvalGatePolicy) -> None:
+    required = {
+        "judge_coverage_rate": (MetricDirection.HIGHER_IS_BETTER, 1.0, None),
+        "answer_correctness": (MetricDirection.HIGHER_IS_BETTER, 0.7, None),
+        "groundedness": (MetricDirection.HIGHER_IS_BETTER, 0.7, None),
+        "unsupported_claim_rate": (MetricDirection.LOWER_IS_BETTER, None, 0.2),
+    }
+    configured = {gate.metric: gate for gate in policy.metric_gates}
+    missing = sorted(set(required) - set(configured))
+    if missing:
+        raise RagEvaluationError(
+            "judged release gate policy is missing metrics: " + ", ".join(missing)
+        )
+    for metric, (direction, minimum, maximum) in required.items():
+        gate = configured[metric]
+        if not gate.required or gate.direction is not direction:
+            raise RagEvaluationError(f"judged release metric gate is weak: {metric}")
+        if minimum is not None and (gate.minimum is None or gate.minimum < minimum):
+            raise RagEvaluationError(f"judged release metric minimum is weak: {metric}")
+        if maximum is not None and (gate.maximum is None or gate.maximum > maximum):
+            raise RagEvaluationError(f"judged release metric maximum is weak: {metric}")
+        if gate.max_regression > 0.02:
+            raise RagEvaluationError(
+                f"judged release metric regression tolerance is weak: {metric}"
             )
 
 

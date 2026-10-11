@@ -4,13 +4,15 @@ import asyncio
 import inspect
 import math
 import os
+import threading
 import time
 import unicodedata
 from collections import OrderedDict
-from collections.abc import Awaitable, Callable, Sequence
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from enum import StrEnum
+from numbers import Real
 from typing import Any, Protocol
 
 from backend.providers.core import (
@@ -24,6 +26,7 @@ from backend.providers.loop_bridge import ProviderLoopBridge
 
 
 Vector = list[float]
+SparseVector = dict[int, float]
 ModelFactory = Callable[[], Any]
 
 
@@ -69,6 +72,12 @@ class EmbeddingRuntimeStats:
     inflight_joins: int
     batches: int
     encoded_texts: int
+
+
+@dataclass(frozen=True)
+class BgeM3Features:
+    dense: Vector
+    sparse: SparseVector
 
 
 class EmbeddingProvider(Protocol):
@@ -123,6 +132,9 @@ class EmbeddingRuntime:
         model_name: str | None = None,
         model_revision: str | None = None,
         device: str | None = None,
+        backend: str = "sentence_transformers",
+        query_max_tokens: int = 128,
+        document_max_tokens: int = 512,
         provider_name: str = "embedding-model",
         model_factory: ModelFactory | None = None,
         provider_executor: ProviderExecutor | None = None,
@@ -148,6 +160,19 @@ class EmbeddingRuntime:
         _validate_positive_int("max_queue_size", max_queue_size)
         _validate_positive_int("max_request_size", max_request_size)
         _validate_positive_int("max_text_characters", max_text_characters)
+        if backend not in {"sentence_transformers", "bge_m3"}:
+            raise ValueError("unsupported embedding backend")
+        if backend == "bge_m3" and encoder_concurrency != 1:
+            raise ValueError("the BGE-M3 model requires one encoder at a time")
+        if backend == "bge_m3" and workers != 1:
+            raise ValueError("the BGE-M3 model requires one executor worker")
+        for name, value in (
+            ("query_max_tokens", query_max_tokens),
+            ("document_max_tokens", document_max_tokens),
+        ):
+            _validate_positive_int(name, value)
+            if value > 8192:
+                raise ValueError(f"{name} must not exceed 8192")
         if cache_size < 0:
             raise ValueError("cache_size cannot be negative")
         if microbatch_window_seconds < 0 or not math.isfinite(
@@ -176,6 +201,9 @@ class EmbeddingRuntime:
             else (os.getenv("EMBEDDING_MODEL_REVISION") or "").strip()
         )
         self.device = (device or os.getenv("EMBEDDING_DEVICE") or "cpu").strip()
+        self.backend = backend
+        self._query_max_tokens = query_max_tokens
+        self._document_max_tokens = document_max_tokens
         self.provider_name = provider_name
         if not self.model_name:
             raise ValueError("model_name cannot be empty")
@@ -309,6 +337,81 @@ class EmbeddingRuntime:
             context=context,
             policy=policy or self._policy,
         )
+
+    async def embed_m3_features(
+        self,
+        texts: Sequence[str],
+        *,
+        mode: EmbeddingMode,
+        deadline: float | None = None,
+        cancellation: CancellationProbe | None = None,
+    ) -> list[BgeM3Features]:
+        """Return both retrieval heads from one BGE-M3 inference pass."""
+        if self.backend != "bge_m3":
+            raise RuntimeError("BGE-M3 features require the bge_m3 backend")
+        self._raise_if_closed()
+        if isinstance(texts, (str, bytes)) or len(texts) > self._max_request_size:
+            raise ValueError("invalid BGE-M3 feature request size")
+        normalized = [self._normalize_input(text) for text in texts]
+        if not normalized:
+            return []
+        context = ProviderCallContext(
+            provider=self.provider_name,
+            operation=ProviderOperation.EMBEDDING,
+            deadline=self._resolve_deadline(deadline),
+            cancellation=cancellation,
+        )
+        return await self._provider_executor.acall(
+            lambda: self._encode_m3_features_once(normalized, mode, cancellation),
+            context=context,
+            policy=self._policy,
+        )
+
+    async def score_m3_colbert(
+        self,
+        query: str,
+        documents: Sequence[str],
+        *,
+        cancellation: CancellationProbe | None = None,
+    ) -> list[float]:
+        """Raw bounded inference; the reranker Adapter owns the Provider deadline."""
+        if self.backend != "bge_m3":
+            raise RuntimeError("ColBERT requires the bge_m3 backend")
+        self._raise_if_closed()
+        if isinstance(documents, (str, bytes)) or len(documents) > 500:
+            raise ValueError("invalid ColBERT candidate count")
+        normalized_query = self._normalize_input(query)
+        normalized_documents = [self._normalize_input(text) for text in documents]
+        if not normalized_documents:
+            return []
+        await self._ensure_started()
+        self._raise_if_cancelled(cancellation)
+        gate = self._require_encoder_gate()
+        async with gate:
+            model = await self._get_model()
+            loop = asyncio.get_running_loop()
+            stop = threading.Event()
+            try:
+                raw = await loop.run_in_executor(
+                    self._executor,
+                    self._score_m3_colbert_sync,
+                    model,
+                    normalized_query,
+                    normalized_documents,
+                    stop,
+                )
+            except asyncio.CancelledError:
+                stop.set()
+                raise
+        self._raise_if_cancelled(cancellation)
+        if len(raw) != len(documents) or any(
+            isinstance(score, bool)
+            or not isinstance(score, (float, int))
+            or not math.isfinite(float(score))
+            for score in raw
+        ):
+            raise ValueError("BGE-M3 returned invalid ColBERT scores")
+        return [float(score) for score in raw]
 
     async def warmup(
         self,
@@ -669,12 +772,126 @@ class EmbeddingRuntime:
                 self._model = model
         return self._model
 
+    async def _encode_m3_features_once(
+        self,
+        texts: Sequence[str],
+        mode: EmbeddingMode,
+        cancellation: CancellationProbe | None,
+    ) -> list[BgeM3Features]:
+        await self._ensure_started()
+        self._raise_if_cancelled(cancellation)
+        gate = self._require_encoder_gate()
+        async with gate:
+            model = await self._get_model()
+            loop = asyncio.get_running_loop()
+            raw = await loop.run_in_executor(
+                self._executor, self._encode_m3_sync, model, mode, texts, True
+            )
+        self._raise_if_cancelled(cancellation)
+        if not isinstance(raw, Mapping):
+            raise ValueError("BGE-M3 returned an invalid feature result")
+        vectors = self._validate_vectors(
+            raw.get("dense_vecs"), expected_count=len(texts)
+        )
+        weights = raw.get("lexical_weights")
+        if not isinstance(weights, list) or len(weights) != len(texts):
+            raise ValueError("BGE-M3 returned an invalid sparse vector count")
+        features: list[BgeM3Features] = []
+        for dense, lexical in zip(vectors, weights, strict=True):
+            if not isinstance(lexical, Mapping) or not lexical:
+                raise ValueError("BGE-M3 returned an empty sparse vector")
+            sparse: SparseVector = {}
+            for raw_id, raw_weight in lexical.items():
+                if not isinstance(raw_id, str) or not raw_id.isdecimal():
+                    raise ValueError("BGE-M3 returned an invalid sparse token ID")
+                token_id = int(raw_id)
+                if (
+                    token_id in sparse
+                    or isinstance(raw_weight, bool)
+                    or not isinstance(raw_weight, Real)
+                    or not math.isfinite(float(raw_weight))
+                    or float(raw_weight) <= 0
+                ):
+                    raise ValueError("BGE-M3 returned an invalid sparse weight")
+                sparse[token_id] = float(raw_weight)
+            features.append(BgeM3Features(dense=list(dense), sparse=sparse))
+        return features
+
+    def _encode_m3_sync(
+        self,
+        model: Any,
+        mode: EmbeddingMode,
+        texts: Sequence[str],
+        return_sparse: bool,
+    ) -> Any:
+        method = (
+            model.encode_queries if mode is EmbeddingMode.QUERY else model.encode_corpus
+        )
+        return method(
+            list(texts),
+            batch_size=self._max_batch_size,
+            max_length=(
+                self._query_max_tokens
+                if mode is EmbeddingMode.QUERY
+                else self._document_max_tokens
+            ),
+            return_dense=True,
+            return_sparse=return_sparse,
+            return_colbert_vecs=False,
+        )
+
+    def _score_m3_colbert_sync(
+        self,
+        model: Any,
+        query: str,
+        documents: Sequence[str],
+        stop: threading.Event,
+    ) -> list[float]:
+        query_vectors = model.encode_queries(
+            [query],
+            batch_size=self._max_batch_size,
+            max_length=self._query_max_tokens,
+            return_dense=False,
+            return_sparse=False,
+            return_colbert_vecs=True,
+        )["colbert_vecs"]
+        if len(query_vectors) != 1:
+            raise ValueError("BGE-M3 returned an invalid ColBERT vector count")
+        scores: list[float] = []
+        batch_size = min(self._max_batch_size, 4)
+        for start in range(0, len(documents), batch_size):
+            if stop.is_set():
+                return []
+            batch = list(documents[start : start + batch_size])
+            document_vectors = model.encode_corpus(
+                batch,
+                batch_size=self._max_batch_size,
+                max_length=self._document_max_tokens,
+                return_dense=False,
+                return_sparse=False,
+                return_colbert_vecs=True,
+            )["colbert_vecs"]
+            if len(document_vectors) != len(batch):
+                raise ValueError("BGE-M3 returned an invalid ColBERT vector count")
+            if stop.is_set():
+                return []
+            scores.extend(
+                float(model.colbert_score(query_vectors[0], vector))
+                for vector in document_vectors
+            )
+        return scores
+
     def _encode_sync(
         self,
         model: Any,
         mode: EmbeddingMode,
         texts: Sequence[str],
     ) -> Any:
+        if self.backend == "bge_m3":
+            raw = self._encode_m3_sync(model, mode, texts, False)
+            if not isinstance(raw, Mapping):
+                raise ValueError("BGE-M3 returned an invalid dense result")
+            return raw.get("dense_vecs")
         method_name = (
             "encode_query" if mode is EmbeddingMode.QUERY else "encode_document"
         )
@@ -796,6 +1013,19 @@ class EmbeddingRuntime:
         return self._clock() + self._default_timeout_seconds
 
     def _create_default_model(self) -> Any:
+        if self.backend == "bge_m3":
+            from FlagEmbedding import BGEM3FlagModel
+            from huggingface_hub import snapshot_download
+
+            model_path = snapshot_download(
+                repo_id=self.model_name,
+                revision=self.model_revision or None,
+            )
+            return BGEM3FlagModel(
+                model_path,
+                devices=self.device,
+                use_fp16=self.device.startswith("cuda"),
+            )
         from sentence_transformers import SentenceTransformer
 
         kwargs: dict[str, Any] = {"device": self.device}
@@ -869,6 +1099,40 @@ class EmbeddingService:
             lambda: self._runtime.embed_query(
                 text,
                 scope=scope,
+                deadline=deadline,
+                cancellation=cancellation,
+            ),
+            cancellation=cancellation,
+        )
+
+    def embed_m3_query(
+        self,
+        text: str,
+        *,
+        deadline: float | None = None,
+        cancellation: CancellationProbe | None = None,
+    ) -> BgeM3Features:
+        return self._bridge.call_sync(
+            lambda: self._runtime.embed_m3_features(
+                [text],
+                mode=EmbeddingMode.QUERY,
+                deadline=deadline,
+                cancellation=cancellation,
+            ),
+            cancellation=cancellation,
+        )[0]
+
+    def embed_m3_documents(
+        self,
+        texts: Sequence[str],
+        *,
+        deadline: float | None = None,
+        cancellation: CancellationProbe | None = None,
+    ) -> list[BgeM3Features]:
+        return self._bridge.call_sync(
+            lambda: self._runtime.embed_m3_features(
+                texts,
+                mode=EmbeddingMode.DOCUMENT,
                 deadline=deadline,
                 cancellation=cancellation,
             ),

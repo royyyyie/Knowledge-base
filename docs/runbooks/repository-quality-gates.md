@@ -97,6 +97,29 @@ uv run --no-sync python scripts/evaluate_rag.py score \
 cmp /tmp/rebuilt-rag-baseline.json evals/rag/baseline_v1.json
 ```
 
+真实 RAG 发布检查在已加载 `evals/rag/corpus/` 的隔离知识库、可用的 Milvus、Provider 和
+Answer/Evaluator 模型下，从仓库根目录运行；把占位符替换为当前有效的检索索引身份：
+
+```bash
+uv run --no-sync python scripts/evaluate_rag.py run \
+  --dataset evals/rag/rag_smoke_v1.json \
+  --gates evals/rag/judged_live_gates_v1.json \
+  --observations .artifacts/rag-eval/judged-observations.json \
+  --report .artifacts/rag-eval/judged-report.json \
+  --markdown .artifacts/rag-eval/judged-report.md \
+  --profile-id local-orion-eval-v1 \
+  --index-id your-current-index-id \
+  --judge-answers \
+  --fail-on-regression
+```
+
+期望退出码为 0，Report 中 `judge_coverage_rate=1`，且 Answer Judge 质量门禁全部通过。
+退出码 1 表示质量门禁失败，2 表示输入、身份或运行错误。基线只能来自相同 Dataset、语料、
+模型配置、索引、Gate policy、评测模式与源码；`--allow-source-mismatch` 生成的报告仅用于调查且不通过发布
+门禁。默认不带 `--judge-answers` 的 live 命令只评测检索与路由，不能作为答案质量结论。
+若所有 Case 同时出现 `PROVIDER_REQUEST_INVALID` 且 Judge 覆盖率为 0，先检查 Fast、Grader、
+Evaluator 模型端点是否支持 `response_format=json_object`，不要把此类 Provider 故障解读为检索质量。
+
 非模型 Runtime 开销使用固定 fake Adapter 与 ASGI transport 建立可复现基线，避免把真实模型
 和外部网络波动混入仓库门禁：
 

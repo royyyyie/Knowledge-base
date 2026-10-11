@@ -7,6 +7,29 @@
 - API 与 worker 的 `UPLOAD_DIR` 指向同一个共享目录或持久卷。
 - 数据库已执行 `alembic upgrade head`，且 Document、Document Version、ParentChunk 与索引数据都具有完整版本身份。
 - API 与 worker 使用相同的 parser、chunker、Embedding revision 与 index version。
+- PDF 扫描页需要 worker 可执行 `tesseract`，并安装 `chi_sim`、`eng` 语言数据；旧版
+  `.doc/.xls` 需要 `soffice`。这些系统程序只在索引 worker 上运行，不由 API 导入。
+
+升级到 `document-loader-v4` / `three-level-800-100-v4` 后，准备 worker 环境。
+
+Ubuntu worker 可按需安装系统解析程序：
+
+```bash
+sudo apt install tesseract-ocr tesseract-ocr-chi-sim tesseract-ocr-eng libreoffice
+```
+
+随后核对：
+
+```bash
+uv sync --dev --locked
+tesseract --list-langs
+soffice --version
+```
+
+`tesseract --list-langs` 应包含 `chi_sim` 和 `eng`。如果暂不处理扫描 PDF 或旧版 Office，
+可以不安装相应系统程序；上传这类文件的候选 Index Job 会以 `DOCUMENT_PARSE_FAILED`
+失败，已发布 Document Version 不受影响。生产环境应将转换/OCR 放在无外部网络、
+有 CPU/内存限制的 indexing worker 容器中，并固定系统程序及语言包版本。
 
 ## 本地联合启动
 
@@ -75,6 +98,11 @@ INDEX_WORKER_READINESS_TTL_SECONDS=45
 `INDEX_WORKER_ID` 只是可读前缀；进程入口会追加 host、PID 与随机后缀。两个活跃进程不能共享完整 worker identity。
 
 worker heartbeat 携带当前 Document build fingerprint。API readiness 只统计 fingerprint 匹配的 worker；不匹配的进程不能满足 readiness，也不能领取非 STAGED Index Job。
+
+新解析器沿用候选版本、三级分块、ParentChunk/Milvus manifest 核验和原子发布。
+`MAX_WORKBOOK_ROWS` 默认 10000，`MAX_WORKBOOK_CELLS` 默认 250000；PDF 沿用
+`MAX_DOCUMENT_PAGES` 和 `MAX_PAGE_CHARACTERS`。解析超时、超限、扫描页无 OCR 或
+旧格式无转换器均为确定性解析失败，应先修环境或文件，再重新上传生成新 Document Version。
 
 ## 正常停止与恢复验证
 

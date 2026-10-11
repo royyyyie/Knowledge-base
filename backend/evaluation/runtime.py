@@ -7,7 +7,12 @@ from dataclasses import dataclass
 
 from pydantic import Field
 
-from backend.agent.models import ModelRegistry, ModelRole, model_registry
+from backend.agent.models import (
+    ModelRegistry,
+    ModelRole,
+    invoke_json_structured_output,
+    model_registry,
+)
 from backend.agent.runtime import extract_message_content
 from backend.core.settings import get_settings
 from backend.evaluation.rag import (
@@ -76,11 +81,12 @@ class RagEvaluationRuntime:
         model_snapshot: ModelCatalogSnapshot,
         timeout_seconds: float,
         cancellation: Callable[[], bool],
+        user_id: str = "rag_evaluation_worker",
     ) -> RagEvaluationCaseExecution:
         started_at = self.clock()
         deadline = started_at + max(float(timeout_seconds), 0.1)
         context = RunRequestContext.for_sync(
-            user_id="rag_evaluation_worker",
+            user_id=user_id,
             thread_id=f"{job_id}:{case.id}",
             model_snapshot=model_snapshot,
             tenant_id=get_settings().app.default_tenant_id,
@@ -307,8 +313,8 @@ class RagEvaluationRuntime:
             + json.dumps(payload, ensure_ascii=False, sort_keys=True)
         )
         return self.executor.call(
-            lambda: model.with_structured_output(RagJudgeDecision).invoke(
-                [{"role": "user", "content": prompt}]
+            lambda: invoke_json_structured_output(
+                model, RagJudgeDecision, [{"role": "user", "content": prompt}]
             ),
             context=ProviderCallContext(
                 provider=spec.name,

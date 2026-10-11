@@ -6,9 +6,12 @@
 
 - `rag_smoke_v1.json`：人工标注的版本化 Dataset。
 - `corpus/`：隔离测试知识库使用的受控语料。
+- `rag_benchmark_v2.json` + `corpus_benchmark_v2/`：由 `../../scripts/generate_rag_benchmark_v2.py` 确定性生成的 200 Case / 30 文档合成基准；不是人工标注业务样本。
+- 真实跨格式语料：按 `../../docs/runbooks/cross-format-rag-evaluation.md` 在独立目录保存来源、使用权声明、字节哈希和人工标注；`../../scripts/audit_rag_eval_corpus.py` 只校验资料准备情况。
 - `offline_smoke_observations_v1.json`：验证评分 Contract 的脱敏静态 Observation。
 - `gates_v1.json`：只接受 `contract_smoke` provenance 的离线门禁。
 - `live_gates_v1.json`：只接受生产图 `live_rag` provenance 的门禁。
+- `judged_live_gates_v1.json`：要求完整 Judge 覆盖与答案质量的 live 门禁。
 - `baseline_v1.json`：由 Dataset + offline Observation + Gate 确定性生成的 baseline。
 - `schema/`：从后端 Pydantic 模型生成的 Dataset/Observation/Gate/Report JSON Schema。
 

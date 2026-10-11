@@ -17,6 +17,7 @@ if TYPE_CHECKING:
 
 
 CATALOG_COLLECTION_SUFFIX = "_catalog_v1"
+CATALOG_M3_COLLECTION_SUFFIX = "_catalog_m3_v1"
 _VERSION_SCOPE_FIELDS = (
     "tenant_id",
     "knowledge_base_id",
@@ -161,8 +162,13 @@ class MilvusWriter:
             return self._store_for_collection(normalized)
         if self.versioned_milvus_manager is not None:
             return self.versioned_milvus_manager
+        suffix = (
+            CATALOG_M3_COLLECTION_SUFFIX
+            if getattr(self.milvus_manager, "sparse_mode", "bm25") == "bge_m3"
+            else CATALOG_COLLECTION_SUFFIX
+        )
         return self.milvus_manager.with_collection(
-            f"{self.milvus_manager.collection_name}{CATALOG_COLLECTION_SUFFIX}"
+            f"{self.milvus_manager.collection_name}{suffix}"
         )
 
     def build_version_scope(
@@ -238,6 +244,9 @@ class MilvusWriter:
 
         assert expected_scope is not None
         store = self._versioned_store(collection_name)
+        sparse_mode = getattr(store, "sparse_mode", "bm25")
+        if sparse_mode not in {"bm25", "bge_m3"}:
+            raise ValueError("unsupported sparse index layout")
         dense_dim = int(os.getenv("DENSE_EMBEDDING_DIM", "1024"))
         store.init_versioned_collection(dense_dim)
 
@@ -272,13 +281,22 @@ class MilvusWriter:
                 ownership_guard()
             batch = normalized_documents[index : index + batch_size]
             texts = [document["text"] for document in batch]
-            dense_embeddings = self.embedding_service.get_embeddings(texts)
+            if sparse_mode == "bge_m3":
+                features = self.embedding_service.embed_m3_documents(texts)
+                dense_embeddings = [feature.dense for feature in features]
+                sparse_embeddings = [feature.sparse for feature in features]
+            else:
+                dense_embeddings = self.embedding_service.get_embeddings(texts)
+                sparse_embeddings = None
             if len(dense_embeddings) != len(batch):
                 raise RuntimeError(
                     "embedding provider returned an unexpected vector count"
                 )
-            insert_data = [
-                {
+            insert_data = []
+            for position, (document, dense_embedding) in enumerate(
+                zip(batch, dense_embeddings, strict=True)
+            ):
+                record = {
                     "dense_embedding": dense_embedding,
                     "text": document["text"],
                     "filename": document["filename"],
@@ -292,8 +310,9 @@ class MilvusWriter:
                     "chunk_level": int(document.get("chunk_level", 0) or 0),
                     **{field: document[field] for field in _VERSION_METADATA_FIELDS},
                 }
-                for document, dense_embedding in zip(batch, dense_embeddings)
-            ]
+                if sparse_embeddings is not None:
+                    record["m3_sparse_embedding"] = sparse_embeddings[position]
+                insert_data.append(record)
             response = store.insert(insert_data)
             if ownership_guard:
                 ownership_guard()

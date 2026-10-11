@@ -97,6 +97,18 @@ class RagSettings(_EnvSettings):
 
 class EmbeddingSettings(_EnvSettings):
     model: str = Field(default="BAAI/bge-m3", validation_alias="EMBEDDING_MODEL")
+    backend: Literal["sentence_transformers", "bge_m3"] = Field(
+        default="sentence_transformers", validation_alias="EMBEDDING_BACKEND"
+    )
+    sparse_mode: Literal["bm25", "bge_m3"] = Field(
+        default="bm25", validation_alias="RAG_SPARSE_MODE"
+    )
+    query_max_tokens: int = Field(
+        default=128, ge=1, le=8192, validation_alias="M3_QUERY_MAX_TOKENS"
+    )
+    document_max_tokens: int = Field(
+        default=512, ge=1, le=8192, validation_alias="M3_DOCUMENT_MAX_TOKENS"
+    )
     revision: str = Field(
         default="5617a9f61b028005a4858fdac845db406aefb181",
         validation_alias="EMBEDDING_MODEL_REVISION",
@@ -171,6 +183,9 @@ def _is_placeholder(value: str) -> bool:
 
 
 class RerankSettings(_EnvSettings):
+    backend: Literal["http", "colbert"] = Field(
+        default="http", validation_alias="RERANK_BACKEND"
+    )
     model: str = Field(default="", validation_alias="RERANK_MODEL")
     binding_host: str = Field(default="", validation_alias="RERANK_BINDING_HOST")
     api_key: SecretStr = Field(
@@ -187,6 +202,11 @@ class RerankSettings(_EnvSettings):
         default=0.0,
         allow_inf_nan=False,
         validation_alias="RERANK_MIN_SCORE",
+    )
+    colbert_min_score: float = Field(
+        default=-1.0,
+        allow_inf_nan=False,
+        validation_alias="COLBERT_MIN_SCORE",
     )
     max_concurrency: int = Field(
         default=4,
@@ -237,6 +257,8 @@ class RerankSettings(_EnvSettings):
 
     @property
     def enabled(self) -> bool:
+        if self.backend == "colbert":
+            return True
         return not any(
             _is_placeholder(value)
             for value in (
@@ -248,10 +270,14 @@ class RerankSettings(_EnvSettings):
 
     @property
     def endpoint(self) -> str:
-        if not self.enabled:
+        if self.backend != "http" or not self.enabled:
             return ""
         host = self.binding_host.strip().rstrip("/")
         return host if host.endswith("/v1/rerank") else f"{host}/v1/rerank"
+
+    @property
+    def effective_min_score(self) -> float:
+        return self.colbert_min_score if self.backend == "colbert" else self.min_score
 
 
 class RunSettings(_EnvSettings):
@@ -479,6 +505,16 @@ class StorageSettings(_EnvSettings):
         default=120.0,
         ge=1.0,
         validation_alias="PARSER_TIMEOUT_SECONDS",
+    )
+    max_workbook_rows: int = Field(
+        default=10_000,
+        ge=1,
+        validation_alias="MAX_WORKBOOK_ROWS",
+    )
+    max_workbook_cells: int = Field(
+        default=250_000,
+        ge=1,
+        validation_alias="MAX_WORKBOOK_CELLS",
     )
     max_archive_entries: int = Field(
         default=5000,
@@ -1151,6 +1187,13 @@ class AppSettings(BaseModel):
 
     def validate_startup(self) -> None:
         problems: list[str] = []
+        if self.embedding.sparse_mode == "bge_m3" or self.rerank.backend == "colbert":
+            if self.embedding.backend != "bge_m3":
+                problems.append("BGE-M3 Sparse/ColBERT 需要 EMBEDDING_BACKEND=bge_m3")
+            if self.embedding.model != "BAAI/bge-m3":
+                problems.append(
+                    "BGE-M3 Sparse/ColBERT 需要 EMBEDDING_MODEL=BAAI/bge-m3"
+                )
         secret = self.security.jwt_secret_key.get_secret_value().strip()
         if len(secret) < 32 or secret.lower() in _WEAK_SECRETS:
             problems.append("JWT_SECRET_KEY 必须是至少 32 字符的随机密钥")

@@ -1,10 +1,10 @@
 """
-HTML 知识库处理：编码检测、去脚本/样式、语义线性化，并按章节拆成多「页」供三层分块复用。
+HTML 知识库处理：编码检测、去脚本/样式、结构线性化，并按章节拆成多「页」供三层分块复用。
 
 设计要点：
 - 优先解析 <main>/<article>，否则 <body>，避免全站导航噪声。
-- 将 h1–h4 与段落、列表项按文档顺序线性化，标题转为 Markdown 风格前缀。
-- 若存在多个二级标题区块，按区块拆成多个 page_number，改善 chunk_id 分散与可解释性。
+- 将 h1–h4 与段落、列表项按文档顺序线性化，表格按行保留表头和值的关系。
+- 只为有正文的章节生成 page_number；标题路径随章节传给分块器。
 """
 
 from __future__ import annotations
@@ -16,6 +16,9 @@ from typing import Any
 from bs4 import BeautifulSoup
 from bs4.element import Comment
 from langchain_core.documents import Document
+
+
+_HEADING_RE = re.compile(r"^(#{1,4}) (.+)$")
 
 
 def _read_html_text(path: Path) -> str:
@@ -54,6 +57,57 @@ def _br_to_newlines(root: Any) -> None:
         br.replace_with("\n")
 
 
+def _table_facts(table: Any) -> list[str]:
+    """Render each data row with its column names, without repeating cell text."""
+
+    rows = [row for row in table.find_all("tr") if row.find_parent("table") is table]
+    if not rows:
+        plain = table.get_text(" ", strip=True)
+        return [plain] if plain else []
+
+    caption_tag = table.find("caption", recursive=False)
+    caption = caption_tag.get_text(" ", strip=True) if caption_tag else ""
+    first_cells = rows[0].find_all(["th", "td"], recursive=False)
+    has_header = bool(first_cells) and (
+        all(cell.name == "th" for cell in first_cells)
+        or rows[0].find_parent("thead") is not None
+    )
+    headers = (
+        [cell.get_text(" ", strip=True) for cell in first_cells] if has_header else []
+    )
+    header_merged = any(
+        cell.get("rowspan", "1") != "1" or cell.get("colspan", "1") != "1"
+        for cell in first_cells
+    )
+    facts: list[str] = []
+    for row in rows[1:] if has_header else rows:
+        cells = row.find_all(["th", "td"], recursive=False)
+        values = [cell.get_text(" ", strip=True) for cell in cells]
+        if not any(values):
+            continue
+        merged = any(
+            cell.get("rowspan", "1") != "1" or cell.get("colspan", "1") != "1"
+            for cell in cells
+        )
+        aligned = (
+            bool(headers)
+            and len(headers) == len(values)
+            and not header_merged
+            and not merged
+        )
+        parts = [
+            f"{(headers[index] if aligned and headers[index] else f'列{index + 1}')}={value}"
+            for index, value in enumerate(values)
+            if value
+        ]
+        fact = "；".join(parts)
+        facts.append(f"{caption}：{fact}" if caption else fact)
+    if facts:
+        return facts
+    plain = table.get_text(" ", strip=True)
+    return [plain] if plain else []
+
+
 def _linearize_blocks(root: Any) -> str:
     _br_to_newlines(root)
 
@@ -66,8 +120,7 @@ def _linearize_blocks(root: Any) -> str:
         "li",
         "blockquote",
         "pre",
-        "td",
-        "th",
+        "table",
         "dd",
         "dt",
         "figcaption",
@@ -75,6 +128,11 @@ def _linearize_blocks(root: Any) -> str:
     parts: list[str] = []
     for el in root.find_all(block_tags, limit=8000):
         if el.find_parent(["script", "style", "noscript"]):
+            continue
+        if el.find_parent("table"):
+            continue
+        if el.name == "table":
+            parts.extend(_table_facts(el))
             continue
         text = el.get_text(" ", strip=True)
         if not text:
@@ -99,7 +157,9 @@ def _linearize_blocks(root: Any) -> str:
     if not structured:
         return plain
 
-    if len(structured) < max(120, int(0.22 * len(plain))):
+    if not root.find(["h1", "h2", "h3", "h4", "table"]) and len(structured) < max(
+        120, int(0.22 * len(plain))
+    ):
         return plain
 
     return structured
@@ -117,22 +177,45 @@ def _split_into_sections(linear: str, page_title: str) -> list[dict[str, Any]]:
     if not text:
         return []
 
-    pieces = re.split(r"(?m)^(?=## .+$)", text)
-    pieces = [p.strip() for p in pieces if p.strip()]
-    if len(pieces) <= 1:
-        head = f"[{page_title}]\n\n" if page_title else ""
-        return [{"page": 1, "title": page_title or "", "text": head + text}]
-
+    headings: dict[int, str] = {}
+    current_lines: list[str] = []
     sections: list[dict[str, Any]] = []
-    for i, block in enumerate(pieces, start=1):
-        first_line = block.split("\n", 1)[0].strip()
-        sec_title = ""
-        if first_line.startswith("## "):
-            sec_title = first_line[3:].strip()
-        elif i == 1 and first_line.startswith("# ") and not first_line.startswith("##"):
-            sec_title = first_line[2:].strip()
-        prefix = f"[章节: {sec_title}]\n\n" if sec_title else ""
-        sections.append({"page": i, "title": sec_title, "text": prefix + block})
+
+    def heading_path() -> tuple[str, ...]:
+        path = [headings[level] for level in sorted(headings)]
+        if page_title and (not path or path[0] != page_title):
+            path.insert(0, page_title)
+        return tuple(path)
+
+    def flush() -> None:
+        body = "\n".join(current_lines).strip()
+        if not body:
+            return
+        path = heading_path()
+        sections.append(
+            {
+                "page": len(sections) + 1,
+                "title": path[-1] if path else "",
+                "heading_path": path,
+                "text": body,
+            }
+        )
+
+    for line in text.splitlines():
+        match = _HEADING_RE.fullmatch(line.strip())
+        if match:
+            flush()
+            current_lines.clear()
+            level = len(match.group(1))
+            headings = {
+                existing_level: title
+                for existing_level, title in headings.items()
+                if existing_level < level
+            }
+            headings[level] = match.group(2).strip()
+        else:
+            current_lines.append(line)
+    flush()
     return sections
 
 
@@ -144,8 +227,6 @@ def parse_html_file_to_sections(file_path: str | Path) -> list[dict[str, Any]]:
     root = _pick_root(soup)
     page_title = _doc_title(soup)
     linear = _linearize_blocks(root)
-    if page_title and linear and not linear.lstrip().startswith("#"):
-        linear = f"# {page_title}\n\n{linear}"
     return _split_into_sections(linear, page_title)
 
 
@@ -161,6 +242,7 @@ def load_html_for_document_loader(file_path: str, filename: str) -> list[Documen
                     "page": sec["page"],
                     "source": filename,
                     "section_title": sec.get("title") or "",
+                    "heading_path": sec["heading_path"],
                 },
             )
         )

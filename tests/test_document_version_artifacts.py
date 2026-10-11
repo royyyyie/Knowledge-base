@@ -6,6 +6,7 @@ from backend.indexing.document_loader import (
     DocumentArtifactMetadata,
     DocumentLoader,
 )
+from backend.indexing.html_processor import parse_html_file_to_sections
 
 
 def _write_html(tmp_path, body: str, *, name: str = "guide.html"):
@@ -57,6 +58,7 @@ def test_versioned_chunk_ids_are_stable_and_do_not_collide(tmp_path):
         "version-a::guide.html::p1::l2::0",
         "version-a::guide.html::p1::l3::0",
     ]
+    assert first[-1]["text"].startswith("[标题路径: Guide]\n\nStable content.")
 
 
 def test_every_chunk_carries_normalized_artifact_metadata_and_content_hash(tmp_path):
@@ -110,3 +112,63 @@ def test_section_id_prefers_source_section_then_stable_page_fallback(tmp_path):
     }
     assert section_ids_by_page == {1: "Intro", 2: "Details"}
     assert {document["section_id"] for document in plain} == {"page:1"}
+
+
+def test_html_headings_only_index_sections_with_body_and_prefix_every_leaf(tmp_path):
+    path = _write_html(
+        tmp_path,
+        "<h1>Warehouse guide</h1>"
+        "<h2>Network</h2><p>Gateway uses TCP 9201.</p>"
+        "<h2>Maintenance</h2><h3>Battery</h3>"
+        f"<p>{'Replace after 700 cycles. ' * 90}</p>",
+    )
+    sections = parse_html_file_to_sections(path)
+    assert len(sections) == 2
+    assert [item["page"] for item in sections] == [1, 2]
+    assert [item["heading_path"] for item in sections] == [
+        ("Warehouse guide", "Network"),
+        ("Warehouse guide", "Maintenance", "Battery"),
+    ]
+
+    leaves = [
+        chunk
+        for chunk in _loader().load_document(
+            str(path), path.name, metadata=_metadata("version-a")
+        )
+        if chunk["chunk_level"] == 3
+    ]
+    assert len(leaves) > 2
+    assert all("[标题路径: Warehouse guide >" in chunk["text"] for chunk in leaves)
+    assert all(
+        "Gateway uses" in chunk["text"] or "Replace after" in chunk["text"]
+        for chunk in leaves
+    )
+    assert all(chunk["section_id"] in {"Network", "Battery"} for chunk in leaves)
+
+
+def test_html_table_rows_keep_header_value_pairs_without_duplicate_cells(tmp_path):
+    path = _write_html(
+        tmp_path,
+        "<h1>Orion 支持套餐</h1>"
+        "<table><caption>响应承诺</caption>"
+        "<tr><th>套餐</th><th>设备上限</th><th>响应时间</th></tr>"
+        "<tr><td>Starter</td><td>10 台</td><td>下一个工作日</td></tr>"
+        "<tr><td>Pro</td><td>50 台</td><td>4 小时</td></tr></table>",
+    )
+    sections = parse_html_file_to_sections(path)
+    assert len(sections) == 1
+    assert sections[0]["text"].splitlines() == [
+        "响应承诺：套餐=Starter；设备上限=10 台；响应时间=下一个工作日",
+        "响应承诺：套餐=Pro；设备上限=50 台；响应时间=4 小时",
+    ]
+
+    leaves = [
+        chunk
+        for chunk in _loader().load_document(
+            str(path), path.name, metadata=_metadata("version-a")
+        )
+        if chunk["chunk_level"] == 3
+    ]
+    assert len(leaves) == 1
+    assert leaves[0]["text"].startswith("[标题路径: Orion 支持套餐]")
+    assert leaves[0]["text"].count("套餐=Pro") == 1

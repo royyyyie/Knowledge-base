@@ -2,19 +2,23 @@
 
 import hashlib
 import re
+import time
 import unicodedata
 from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Dict, List
 
-from langchain_community.document_loaders import (
-    Docx2txtLoader,
-    PyPDFLoader,
-    UnstructuredExcelLoader,
-)
+from langchain_core.documents import Document
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
 from backend.core.settings import get_settings
+from backend.indexing.pdf_parser import parse_pdf
+from backend.indexing.structured_parser import (
+    ParsedElement,
+    convert_legacy_office,
+    parse_docx,
+    parse_xlsx,
+)
 
 # 编译非打印 C0/C1 控制字符的正则（保留常规排版字：\t, \n, \r）
 _CONTROL_CHAR_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
@@ -170,8 +174,10 @@ class DocumentLoader:
         level: int,
         index: int,
         document_version_id: str = "",
+        source_unit_id: str = "",
     ) -> str:
-        chunk_path = f"{filename}::p{page_number}::l{level}::{index}"
+        unit = f"::u{source_unit_id}" if source_unit_id else ""
+        chunk_path = f"{filename}{unit}::p{page_number}::l{level}::{index}"
         if not document_version_id:
             raise ValueError("document_version_id must not be empty")
         return f"{document_version_id}::{chunk_path}"
@@ -215,14 +221,24 @@ class DocumentLoader:
         text: str,
         base_doc: Dict,
         page_global_chunk_idx: int,
+        *,
+        heading_path: tuple[str, ...] = (),
     ) -> List[Dict]:
         if not text:
             return []
+
+        heading_prefix = (
+            f"[标题路径: {' > '.join(heading_path)}]\n\n" if heading_path else ""
+        )
+
+        def with_heading_path(chunk_text: str) -> str:
+            return f"{heading_prefix}{chunk_text}" if heading_prefix else chunk_text
 
         root_chunks: List[Dict] = []
         page_number = int(base_doc.get("page_number", 0))
         filename = base_doc["filename"]
         document_version_id = base_doc.get("document_version_id", "")
+        source_unit_id = base_doc.get("source_unit_id", "")
 
         level_1_docs = self._splitter_level_1.create_documents([text], [base_doc])
         level_1_counter = 0
@@ -233,24 +249,26 @@ class DocumentLoader:
             level_1_text = (level_1_doc.page_content or "").strip()
             if not level_1_text:
                 continue
+            level_1_index_text = with_heading_path(level_1_text)
             level_1_id = self._build_chunk_id(
                 filename,
                 page_number,
                 1,
                 level_1_counter,
                 document_version_id,
+                source_unit_id,
             )
             level_1_counter += 1
 
             level_1_chunk = {
                 **base_doc,
-                "text": level_1_text,
+                "text": level_1_index_text,
                 "chunk_id": level_1_id,
                 "parent_chunk_id": "",
                 "root_chunk_id": level_1_id,
                 "chunk_level": 1,
                 "chunk_idx": page_global_chunk_idx,
-                "content_hash": self._content_hash(level_1_text),
+                "content_hash": self._content_hash(level_1_index_text),
             }
             page_global_chunk_idx += 1
             root_chunks.append(level_1_chunk)
@@ -262,24 +280,26 @@ class DocumentLoader:
                 level_2_text = (level_2_doc.page_content or "").strip()
                 if not level_2_text:
                     continue
+                level_2_index_text = with_heading_path(level_2_text)
                 level_2_id = self._build_chunk_id(
                     filename,
                     page_number,
                     2,
                     level_2_counter,
                     document_version_id,
+                    source_unit_id,
                 )
                 level_2_counter += 1
 
                 level_2_chunk = {
                     **base_doc,
-                    "text": level_2_text,
+                    "text": level_2_index_text,
                     "chunk_id": level_2_id,
                     "parent_chunk_id": level_1_id,
                     "root_chunk_id": level_1_id,
                     "chunk_level": 2,
                     "chunk_idx": page_global_chunk_idx,
-                    "content_hash": self._content_hash(level_2_text),
+                    "content_hash": self._content_hash(level_2_index_text),
                 }
                 page_global_chunk_idx += 1
                 root_chunks.append(level_2_chunk)
@@ -291,24 +311,26 @@ class DocumentLoader:
                     level_3_text = (level_3_doc.page_content or "").strip()
                     if not level_3_text:
                         continue
+                    level_3_index_text = with_heading_path(level_3_text)
                     level_3_id = self._build_chunk_id(
                         filename,
                         page_number,
                         3,
                         level_3_counter,
                         document_version_id,
+                        source_unit_id,
                     )
                     level_3_counter += 1
                     root_chunks.append(
                         {
                             **base_doc,
-                            "text": level_3_text,
+                            "text": level_3_index_text,
                             "chunk_id": level_3_id,
                             "parent_chunk_id": level_2_id,
                             "root_chunk_id": level_1_id,
                             "chunk_level": 3,
                             "chunk_idx": page_global_chunk_idx,
-                            "content_hash": self._content_hash(level_3_text),
+                            "content_hash": self._content_hash(level_3_index_text),
                         }
                     )
                     page_global_chunk_idx += 1
@@ -322,8 +344,10 @@ class DocumentLoader:
         filename: str,
         doc_type: str,
         metadata: DocumentArtifactMetadata,
+        *,
+        enforce_page_count: bool = True,
     ) -> list[dict]:
-        if len(raw_docs) > self.max_pages:
+        if enforce_page_count and len(raw_docs) > self.max_pages:
             raise ValueError(f"文档页数超过限制（最多 {self.max_pages} 页）")
         documents: list[dict] = []
         page_global_chunk_idx = 0
@@ -348,14 +372,60 @@ class DocumentLoader:
                 "page_number": page_num,
                 **self._artifact_metadata_for_page(meta, metadata, page_num),
             }
+            source_unit_id = _normalize_metadata_text(meta.get("source_unit_id"))
+            if source_unit_id:
+                if not re.fullmatch(r"[a-zA-Z0-9_-]{1,64}", source_unit_id):
+                    raise ValueError("source_unit_id 格式无效")
+                base_doc["source_unit_id"] = source_unit_id
+            raw_heading_path = meta.get("heading_path", ())
+            heading_path = (
+                tuple(
+                    normalized
+                    for part in raw_heading_path
+                    if isinstance(part, str)
+                    if (normalized := sanitize_text(part).strip())
+                )
+                if isinstance(raw_heading_path, (list, tuple))
+                else ()
+            )
             page_chunks = self._split_page_to_three_levels(
                 text=page_content,
                 base_doc=base_doc,
                 page_global_chunk_idx=page_global_chunk_idx,
+                heading_path=heading_path,
             )
             page_global_chunk_idx += len(page_chunks)
             documents.extend(page_chunks)
         return documents
+
+    def _load_structured_elements(
+        self,
+        elements: list[ParsedElement],
+        file_path: str,
+        filename: str,
+        doc_type: str,
+        metadata: DocumentArtifactMetadata,
+    ) -> list[dict]:
+        raw_docs = [
+            Document(
+                page_content=element.text,
+                metadata={
+                    "page": element.page_number,
+                    "section_id": element.section_id,
+                    "heading_path": element.heading_path,
+                    "source_unit_id": element.unit_id,
+                },
+            )
+            for element in elements
+        ]
+        return self._load_from_langchain_docs(
+            raw_docs,
+            file_path,
+            filename,
+            doc_type,
+            metadata,
+            enforce_page_count=False,
+        )
 
     def load_document(
         self,
@@ -366,16 +436,7 @@ class DocumentLoader:
     ) -> list[dict]:
         file_lower = filename.lower()
 
-        if file_lower.endswith(".pdf"):
-            doc_type = "PDF"
-            loader = PyPDFLoader(file_path)
-        elif file_lower.endswith((".docx", ".doc")):
-            doc_type = "Word"
-            loader = Docx2txtLoader(file_path)
-        elif file_lower.endswith((".xlsx", ".xls")):
-            doc_type = "Excel"
-            loader = UnstructuredExcelLoader(file_path)
-        elif file_lower.endswith((".html", ".htm")):
+        if file_lower.endswith((".html", ".htm")):
             doc_type = "HTML"
             from backend.indexing.html_processor import load_html_for_document_loader
 
@@ -387,17 +448,74 @@ class DocumentLoader:
                 doc_type,
                 metadata,
             )
+        storage = get_settings().storage
+        deadline = time.monotonic() + storage.parser_timeout_seconds
+
+        def remaining_time() -> float:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("文档解析超时")
+            return remaining
+
+        max_elements = min(self.max_pages * 5, 10_000)
+        if file_lower.endswith(".pdf"):
+            elements = parse_pdf(
+                file_path,
+                max_pages=self.max_pages,
+                max_page_characters=self.max_page_characters,
+                max_elements=max_elements,
+                timeout_seconds=remaining_time(),
+            )
+            doc_type = "PDF"
+        elif file_lower.endswith(".docx"):
+            elements = parse_docx(
+                file_path,
+                max_elements=max_elements,
+                max_element_characters=self.max_page_characters,
+                timeout_seconds=remaining_time(),
+            )
+            doc_type = "Word"
+        elif file_lower.endswith(".xlsx"):
+            elements = parse_xlsx(
+                file_path,
+                max_rows=storage.max_workbook_rows,
+                max_cells=storage.max_workbook_cells,
+                max_elements=max_elements,
+                max_element_characters=self.max_page_characters,
+                timeout_seconds=remaining_time(),
+            )
+            doc_type = "Excel"
+        elif file_lower.endswith((".doc", ".xls")):
+            is_word = file_lower.endswith(".doc")
+            temporary, converted = convert_legacy_office(
+                file_path,
+                target_extension="docx" if is_word else "xlsx",
+                timeout_seconds=remaining_time(),
+            )
+            try:
+                if is_word:
+                    elements = parse_docx(
+                        converted,
+                        max_elements=max_elements,
+                        max_element_characters=self.max_page_characters,
+                        timeout_seconds=remaining_time(),
+                    )
+                else:
+                    elements = parse_xlsx(
+                        converted,
+                        max_rows=storage.max_workbook_rows,
+                        max_cells=storage.max_workbook_cells,
+                        max_elements=max_elements,
+                        max_element_characters=self.max_page_characters,
+                        timeout_seconds=remaining_time(),
+                    )
+            finally:
+                temporary.cleanup()
+            doc_type = "Word" if is_word else "Excel"
         else:
             raise ValueError(f"不支持的文件类型: {filename}")
-
-        try:
-            raw_docs = loader.load()
-            return self._load_from_langchain_docs(
-                raw_docs,
-                file_path,
-                filename,
-                doc_type,
-                metadata,
-            )
-        except Exception as e:
-            raise Exception(f"处理文档失败: {str(e)}") from e
+        if not elements:
+            raise ValueError("文档没有可检索的结构化正文")
+        return self._load_structured_elements(
+            elements, file_path, filename, doc_type, metadata
+        )

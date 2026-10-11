@@ -19,6 +19,7 @@ from backend.evaluation.rag import (
     RagEvalReport,
     evaluate_rag,
     evaluate_rag_partial,
+    gate_policy_fingerprint,
 )
 from backend.evaluation.rag_adapters import rag_source_fingerprint
 from backend.evaluation.repository import (
@@ -126,6 +127,9 @@ class RagEvaluationWorker:
         heartbeat_error: Event,
     ) -> None:
         case_index = {case.id: case for case in claimed.dataset.dataset.cases}
+        seen_index_ids = self._observed_index_ids(claimed.job.id)
+        if len(seen_index_ids) > 1:
+            raise RuntimeError("RAG evaluation document index changed during job")
         while True:
             if heartbeat_error.is_set():
                 raise RuntimeError("RAG evaluation worker lost job ownership")
@@ -157,6 +161,12 @@ class RagEvaluationWorker:
                     or self.repository.cancel_requested(claimed.job.id)
                 ),
             )
+            case_index_ids = set(execution.observation.retrieval_index_ids)
+            if len(case_index_ids) > 1 or (
+                seen_index_ids and case_index_ids and case_index_ids != seen_index_ids
+            ):
+                raise RuntimeError("RAG evaluation document index changed during job")
+            seen_index_ids.update(case_index_ids)
             self.repository.complete_case(
                 job_id=claimed.job.id,
                 case_id=case.id,
@@ -235,23 +245,26 @@ class RagEvaluationWorker:
             }
             for role, spec in claimed.job.model_snapshot.assignments.items()
         }
-        retrieval_index_ids = sorted(
-            {
-                str(identity["index_version"])
-                for case in self.repository.list_cases(claimed.job.id)
-                for identity in case.retrieved_identities
-                if identity.get("index_version")
-            }
-        )
+        retrieval_index_ids = sorted(self._observed_index_ids(claimed.job.id))
         return {
             "adapter": "persistent_rag_evaluation_worker",
             "provenance": "live_rag",
+            "evaluation_mode": "answer_judge",
+            "gate_policy_fingerprint": gate_policy_fingerprint(claimed.job.gate_policy),
             "job_id": claimed.job.id,
             "model_catalog_hash": claimed.job.model_catalog_hash,
             "models": safe_models,
             "retrieval_index_ids": retrieval_index_ids,
             "rag_source_fingerprint": rag_source_fingerprint(PROJECT_ROOT),
             "judge_schema_version": 1,
+        }
+
+    def _observed_index_ids(self, job_id: str) -> set[str]:
+        return {
+            index_id
+            for case in self.repository.list_cases(job_id)
+            if case.observation is not None
+            for index_id in case.observation.retrieval_index_ids
         }
 
     def _partial_report(

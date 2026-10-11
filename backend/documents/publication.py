@@ -27,6 +27,7 @@ from backend.documents.catalog import (
 from backend.indexing.document_loader import DocumentArtifactMetadata, DocumentLoader
 from backend.indexing.milvus_client import MilvusSettings
 from backend.indexing.milvus_writer import (
+    CATALOG_M3_COLLECTION_SUFFIX,
     CATALOG_COLLECTION_SUFFIX,
     IndexVersionScope,
     MilvusWriter,
@@ -82,9 +83,19 @@ class DocumentPublicationConfig:
     def from_runtime(cls) -> DocumentPublicationConfig:
         settings = get_settings()
         base_collection = MilvusSettings.from_env().collection_name
-        embedding_identity = (
-            f"{settings.embedding.model}@{settings.embedding.revision}"
-        )[:160]
+        embedding_identity = f"{settings.embedding.model}@{settings.embedding.revision}"
+        if settings.embedding.backend == "bge_m3":
+            embedding_identity += (
+                f"|backend=bge_m3|sparse={settings.embedding.sparse_mode}"
+                f"|q={settings.embedding.query_max_tokens}"
+                f"|d={settings.embedding.document_max_tokens}"
+            )
+        embedding_identity = embedding_identity[:160]
+        sparse_suffix = (
+            CATALOG_M3_COLLECTION_SUFFIX
+            if settings.embedding.sparse_mode == "bge_m3"
+            else CATALOG_COLLECTION_SUFFIX
+        )
         return cls(
             tenant_id=os.getenv("DEFAULT_TENANT_ID", "default").strip() or "default",
             knowledge_base_name=(
@@ -92,19 +103,28 @@ class DocumentPublicationConfig:
                 or "默认知识库"
             ),
             parser_version=(
-                os.getenv("DOCUMENT_PARSER_VERSION", "document-loader-v2").strip()
-                or "document-loader-v2"
+                os.getenv("DOCUMENT_PARSER_VERSION", "document-loader-v4").strip()
+                or "document-loader-v4"
             ),
             chunker_version=(
-                os.getenv("DOCUMENT_CHUNKER_VERSION", "three-level-800-100-v2").strip()
-                or "three-level-800-100-v2"
+                os.getenv("DOCUMENT_CHUNKER_VERSION", "three-level-800-100-v4").strip()
+                or "three-level-800-100-v4"
             ),
             embedding_model=embedding_identity,
             index_version=(
-                os.getenv("DOCUMENT_INDEX_VERSION", "catalog-v1").strip()
-                or "catalog-v1"
+                os.getenv(
+                    "DOCUMENT_INDEX_VERSION",
+                    "catalog-m3-v1"
+                    if settings.embedding.sparse_mode == "bge_m3"
+                    else "catalog-v1",
+                ).strip()
+                or (
+                    "catalog-m3-v1"
+                    if settings.embedding.sparse_mode == "bge_m3"
+                    else "catalog-v1"
+                )
             ),
-            vector_collection=f"{base_collection}{CATALOG_COLLECTION_SUFFIX}",
+            vector_collection=f"{base_collection}{sparse_suffix}",
             upload_dir=settings.storage.upload_dir,
             max_attempts=settings.worker.max_attempts,
         )

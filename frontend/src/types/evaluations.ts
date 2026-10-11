@@ -176,6 +176,7 @@ export interface RagEvaluationObservation {
   provider_error_stage?: 'retrieval' | 'generation' | 'judge' | null;
   duration_ms: number;
   judge?: RagJudgeMetrics | null;
+  retrieval_index_ids?: string[];
 }
 
 export interface RagEvaluationCaseResult {

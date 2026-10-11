@@ -62,6 +62,15 @@ class Embedding:
         return [0.1, 0.2]
 
 
+class M3Embedding:
+    def __init__(self):
+        self.calls = []
+
+    def embed_m3_query(self, query, **kwargs):
+        self.calls.append((query, kwargs))
+        return SimpleNamespace(dense=[0.1, 0.2], sparse={42: 0.5})
+
+
 class TargetStore:
     def __init__(self, *, exists=True, hybrid=None, hybrid_error=None, dense=None):
         self.exists = exists
@@ -434,3 +443,21 @@ def test_parent_expansion_observes_cancellation_after_store_call():
             tenant_id="tenant-a",
             cancellation=lambda: cancelled,
         )
+
+
+def test_m3_target_receives_model_sparse_weights_without_dense_fallback():
+    utils = _utils()
+    target = _target("isolated_catalog_m3_v1")
+    embedding = M3Embedding()
+    store = TargetStore(hybrid=[_doc("chunk-m3", "rare term evidence")])
+    store.sparse_mode = "bge_m3"
+    utils._document_retrieval_scope = Scope(_snapshot(target))
+    utils._embedding_service = embedding
+    utils._milvus_manager = RoutedStore({target.collection_name: store})
+
+    result = utils.retrieve_documents("rare term", top_k=1, tenant_id="tenant-a")
+
+    assert [item["chunk_id"] for item in result["docs"]] == ["chunk-m3"]
+    assert embedding.calls[0][0] == "rare term"
+    assert store.hybrid_calls[0]["sparse_embedding"] == {42: 0.5}
+    assert store.dense_calls == []

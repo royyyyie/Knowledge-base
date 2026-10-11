@@ -251,6 +251,124 @@ def test_evaluator_judge_metrics_are_aggregated_and_become_available():
     assert report.cases[0].passed is True
 
 
+def test_judge_coverage_gate_rejects_missing_or_partial_answer_evaluation():
+    dataset = RagEvalDataset(
+        name="judge_coverage",
+        cases=(_answer_case(case_id="first"), _answer_case(case_id="second")),
+    )
+    policy = RagEvalGatePolicy(
+        k_values=(3,),
+        metric_gates=(RagMetricGate(metric="judge_coverage_rate", minimum=1.0),),
+    )
+    judge = RagJudgeMetrics(
+        answer_correctness=1,
+        groundedness=1,
+        answer_relevance=1,
+        completeness=1,
+        context_relevance=1,
+        unsupported_claim_rate=0,
+        conflict_disclosure_rate=1,
+    )
+    observations = (
+        _answer_observation(case_id="first"),
+        _answer_observation(case_id="second"),
+    )
+
+    missing = evaluate_rag(dataset, observations, policy)
+    partial = evaluate_rag(
+        dataset,
+        (observations[0].model_copy(update={"judge": judge}), observations[1]),
+        policy,
+    )
+    complete = evaluate_rag(
+        dataset,
+        tuple(item.model_copy(update={"judge": judge}) for item in observations),
+        policy,
+    )
+
+    assert missing.metrics["case_pass_rate"].value == 1
+    assert missing.metrics["judge_coverage_rate"].value == 0
+    assert partial.metrics["judge_coverage_rate"].value == 0.5
+    assert complete.metrics["judge_coverage_rate"].value == 1
+    assert [report.passed for report in (missing, partial, complete)] == [
+        False,
+        False,
+        True,
+    ]
+    assert "Answer Judge: not evaluated (0/2)" in render_rag_eval_markdown(missing)
+    assert "Answer Judge: partially evaluated (1/2)" in render_rag_eval_markdown(
+        partial
+    )
+
+
+def test_baseline_comparison_rejects_different_live_identity_even_with_source_override():
+    dataset = _dataset(_answer_case())
+    observation = _answer_observation()
+    gates = RagEvalGatePolicy(k_values=(3,))
+    baseline_metadata = {
+        "adapter": "persistent_rag_evaluation_worker",
+        "provenance": "live_rag",
+        "gate_policy_fingerprint": "e" * 64,
+        "rag_source_fingerprint": "a" * 64,
+        "model_catalog_hash": "b" * 64,
+        "retrieval_index_ids": ["index-v1"],
+    }
+    baseline = evaluate_rag(dataset, [observation], gates, metadata=baseline_metadata)
+
+    with pytest.raises(DatasetFingerprintMismatch, match="model_catalog_hash"):
+        evaluate_rag(
+            dataset,
+            [observation],
+            gates,
+            baseline=baseline,
+            metadata={
+                **baseline_metadata,
+                "model_catalog_hash": "c" * 64,
+                "source_mismatch_override": True,
+            },
+        )
+    with pytest.raises(DatasetFingerprintMismatch, match="retrieval_index_ids"):
+        evaluate_rag(
+            dataset,
+            [observation],
+            gates,
+            baseline=baseline,
+            metadata={**baseline_metadata, "retrieval_index_ids": ["index-v2"]},
+        )
+    with pytest.raises(DatasetFingerprintMismatch, match="gate_policy_fingerprint"):
+        evaluate_rag(
+            dataset,
+            [observation],
+            gates,
+            baseline=baseline,
+            metadata={**baseline_metadata, "gate_policy_fingerprint": "f" * 64},
+        )
+    with pytest.raises(DatasetFingerprintMismatch, match="rag_source_fingerprint"):
+        evaluate_rag(
+            dataset,
+            [observation],
+            gates,
+            baseline=baseline,
+            metadata={**baseline_metadata, "rag_source_fingerprint": "d" * 64},
+        )
+    investigation = evaluate_rag(
+        dataset,
+        [observation],
+        gates,
+        baseline=baseline,
+        metadata={
+            **baseline_metadata,
+            "rag_source_fingerprint": "d" * 64,
+            "source_mismatch_override": True,
+        },
+    )
+    assert not investigation.passed
+    assert any(
+        gate.name == "source_identity_override" and gate.status is GateStatus.FAILED
+        for gate in investigation.gates
+    )
+
+
 def test_context_relevance_is_not_applicable_to_no_knowledge_without_context():
     case = RagEvalCase(
         id="no-knowledge",

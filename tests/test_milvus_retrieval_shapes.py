@@ -2,6 +2,7 @@ import importlib.util
 import sys
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from pymilvus.exceptions import ParamError
 
@@ -17,6 +18,42 @@ SPEC.loader.exec_module(milvus)
 
 
 class MilvusRetrievalShapeTests(unittest.TestCase):
+    def test_m3_hybrid_uses_model_sparse_vector_and_inner_product(self):
+        store = milvus.MilvusStore(
+            milvus.MilvusSettings(
+                host="localhost",
+                port="19530",
+                collection_name="test_catalog_m3_v1",
+                uri="http://localhost:19530",
+                timeout=1.0,
+                sparse_mode="bge_m3",
+            )
+        )
+
+        class Client:
+            requests = None
+
+            def hybrid_search(self, **kwargs):
+                self.requests = kwargs["reqs"]
+                return [[]]
+
+        client = Client()
+        store._run = lambda operation: operation(client)
+        with patch.object(milvus, "AnnSearchRequest", side_effect=lambda **kw: kw):
+            self.assertEqual(
+                [],
+                store.hybrid_retrieve(
+                    dense_embedding=[0.1, 0.2],
+                    query="rare term",
+                    sparse_embedding={42: 0.5},
+                ),
+            )
+        self.assertEqual("m3_sparse_embedding", client.requests[1]["anns_field"])
+        self.assertEqual("IP", client.requests[1]["param"]["metric_type"])
+        self.assertEqual([{42: 0.5}], client.requests[1]["data"])
+        with self.assertRaisesRegex(ValueError, "requires a sparse"):
+            store.hybrid_retrieve(dense_embedding=[0.1, 0.2], query="rare term")
+
     def _store(self, response):
         store = milvus.MilvusStore(
             milvus.MilvusSettings(
@@ -248,6 +285,83 @@ class MilvusVersionPrimitiveTests(unittest.TestCase):
         for field in milvus.CATALOG_METADATA_FIELDS:
             self.assertIn(field, client.schema.fields)
         self.assertEqual("candidate_v2", client.created["collection_name"])
+
+    def test_m3_collection_omits_bm25_function_and_rejects_bm25_layout(self):
+        class Schema:
+            def __init__(self):
+                self.fields = []
+                self.functions = []
+
+            def add_field(self, name, *_args, **_kwargs):
+                self.fields.append(name)
+
+            def add_function(self, function):
+                self.functions.append(function)
+
+        class IndexParams:
+            def __init__(self):
+                self.indexes = []
+
+            def add_index(self, **kwargs):
+                self.indexes.append(kwargs)
+
+        class Client:
+            def __init__(self):
+                self.schema = Schema()
+                self.index_params = IndexParams()
+
+            def has_collection(self, _name):
+                return False
+
+            def create_schema(self, **_kwargs):
+                return self.schema
+
+            def prepare_index_params(self):
+                return self.index_params
+
+            def create_collection(self, **_kwargs):
+                return None
+
+        client = Client()
+        self.store.ensure_collection(
+            client,
+            "candidate_catalog_m3_v1",
+            1024,
+            include_catalog_fields=True,
+            sparse_mode="bge_m3",
+        )
+        self.assertIn("m3_sparse_embedding", client.schema.fields)
+        self.assertNotIn("sparse_embedding", client.schema.fields)
+        self.assertFalse(client.schema.functions)
+        sparse_index = next(
+            item
+            for item in client.index_params.indexes
+            if item["field_name"] == "m3_sparse_embedding"
+        )
+        self.assertEqual("IP", sparse_index["metric_type"])
+
+        class ExistingClient:
+            def has_collection(self, _name):
+                return True
+
+            def describe_collection(self, _name):
+                return {"fields": [{"name": name} for name in client.schema.fields]}
+
+        self.store.ensure_collection(
+            ExistingClient(),
+            "candidate_catalog_m3_v1",
+            1024,
+            include_catalog_fields=True,
+            sparse_mode="bge_m3",
+        )
+        with self.assertRaisesRegex(RuntimeError, "missing fields"):
+            self.store.ensure_collection(
+                ExistingClient(),
+                "candidate_catalog_m3_v1",
+                1024,
+                include_catalog_fields=True,
+                sparse_mode="bm25",
+            )
 
     def test_existing_versioned_collection_must_have_explicit_schema(self):
         class Client:

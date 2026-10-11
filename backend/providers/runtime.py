@@ -13,6 +13,7 @@ from backend.providers.embedding import (
 )
 from backend.providers.loop_bridge import ProviderLoopBridge, provider_loop_bridge
 from backend.providers.rerank import (
+    ColbertRerankerAdapter,
     DisabledRerankerAdapter,
     HttpxRerankerAdapter,
     RerankerProvider,
@@ -45,6 +46,9 @@ class ProviderRuntime:
             model_name=embedding.model,
             model_revision=embedding.revision,
             device=embedding.device,
+            backend=embedding.backend,
+            query_max_tokens=embedding.query_max_tokens,
+            document_max_tokens=embedding.document_max_tokens,
             provider_name=embedding.model.rsplit("/", 1)[-1] or "embedding-model",
             encoder_concurrency=embedding.max_concurrency,
             executor_workers=embedding.executor_workers,
@@ -196,8 +200,13 @@ class ProviderRuntime:
             )
         return self._lifecycle_lock
 
-    @staticmethod
-    def _build_reranker(settings: RerankSettings) -> RerankerProvider:
+    def _build_reranker(self, settings: RerankSettings) -> RerankerProvider:
+        if settings.backend == "colbert":
+            return ColbertRerankerAdapter(
+                embedding_runtime=self.embedding_runtime,
+                model=f"{self.settings.embedding.model}@{self.settings.embedding.revision}:colbert",
+                timeout_seconds=settings.timeout_seconds,
+            )
         if not settings.enabled:
             return DisabledRerankerAdapter()
         return HttpxRerankerAdapter(

@@ -99,6 +99,7 @@ class MilvusSettings:
     collection_name: str
     uri: str
     timeout: float
+    sparse_mode: str = "bm25"
 
     @classmethod
     def from_env(cls) -> MilvusSettings:
@@ -106,12 +107,16 @@ class MilvusSettings:
         port = os.getenv("MILVUS_PORT", "19530")
         collection = os.getenv("MILVUS_COLLECTION", "embeddings_collection")
         timeout = float(os.getenv("MILVUS_TIMEOUT", "30"))
+        sparse_mode = os.getenv("RAG_SPARSE_MODE", "bm25").strip().lower()
+        if sparse_mode not in {"bm25", "bge_m3"}:
+            raise ValueError("RAG_SPARSE_MODE must be bm25 or bge_m3")
         return cls(
             host=host,
             port=port,
             collection_name=collection,
             uri=f"http://{host}:{port}",
             timeout=timeout,
+            sparse_mode=sparse_mode,
         )
 
 
@@ -233,13 +238,28 @@ class MilvusStore:
     def collection_name(self) -> str:
         return self._settings.collection_name
 
+    @property
+    def sparse_mode(self) -> str:
+        return self._settings.sparse_mode
+
     def with_collection(self, name: str) -> MilvusStore:
         """返回绑定到另一 collection 的无状态 Adapter。"""
 
         collection_name = (name or "").strip()
         if not collection_name:
             raise ValueError("collection name must not be empty")
-        return MilvusStore(replace(self._settings, collection_name=collection_name))
+        sparse_mode = self._settings.sparse_mode
+        if collection_name.endswith("_catalog_m3_v1"):
+            sparse_mode = "bge_m3"
+        elif collection_name.endswith("_catalog_v1"):
+            sparse_mode = "bm25"
+        return MilvusStore(
+            replace(
+                self._settings,
+                collection_name=collection_name,
+                sparse_mode=sparse_mode,
+            )
+        )
 
     def _run(self, operation: Callable[[MilvusClient], T]) -> T:
         with milvus_client_session(self._settings) as client:
@@ -258,7 +278,13 @@ class MilvusStore:
         dense_dim: int,
         *,
         include_catalog_fields: bool = False,
+        sparse_mode: str = "bm25",
     ) -> None:
+        if sparse_mode not in {"bm25", "bge_m3"}:
+            raise ValueError("unsupported sparse index layout")
+        sparse_field = (
+            "sparse_embedding" if sparse_mode == "bm25" else "m3_sparse_embedding"
+        )
         if client.has_collection(collection_name):
             if include_catalog_fields:
                 description = client.describe_collection(collection_name)
@@ -270,18 +296,28 @@ class MilvusStore:
                 field_names = {
                     field.get("name") for field in fields if isinstance(field, Mapping)
                 }
-                missing = sorted(_CATALOG_SCHEMA_FIELDS - field_names)
+                required_fields = (_CATALOG_SCHEMA_FIELDS - {"sparse_embedding"}) | {
+                    sparse_field
+                }
+                missing = sorted(required_fields - field_names)
                 if missing:
                     raise RuntimeError(
                         "versioned Milvus collection is missing fields: "
                         + ", ".join(missing)
                     )
+                wrong_sparse_field = (
+                    "m3_sparse_embedding"
+                    if sparse_mode == "bm25"
+                    else "sparse_embedding"
+                )
+                if wrong_sparse_field in field_names:
+                    raise RuntimeError("Milvus collection uses another sparse layout")
             return
 
         schema = client.create_schema(auto_id=True, enable_dynamic_field=True)
         schema.add_field("id", DataType.INT64, is_primary=True, auto_id=True)
         schema.add_field("dense_embedding", DataType.FLOAT_VECTOR, dim=dense_dim)
-        schema.add_field("sparse_embedding", DataType.SPARSE_FLOAT_VECTOR)
+        schema.add_field(sparse_field, DataType.SPARSE_FLOAT_VECTOR)
         schema.add_field(
             "text",
             DataType.VARCHAR,
@@ -315,13 +351,14 @@ class MilvusStore:
             schema.add_field("index_version", DataType.VARCHAR, max_length=64)
             schema.add_field("content_hash", DataType.VARCHAR, max_length=64)
 
-        bm25_function = Function(
-            name="text_bm25_emb",
-            function_type=FunctionType.BM25,
-            input_field_names=["text"],
-            output_field_names=["sparse_embedding"],
-        )
-        schema.add_function(bm25_function)
+        if sparse_mode == "bm25":
+            bm25_function = Function(
+                name="text_bm25_emb",
+                function_type=FunctionType.BM25,
+                input_field_names=["text"],
+                output_field_names=[sparse_field],
+            )
+            schema.add_function(bm25_function)
 
         index_params = client.prepare_index_params()
         index_params.add_index(
@@ -331,9 +368,9 @@ class MilvusStore:
             params={"M": 16, "efConstruction": 256},
         )
         index_params.add_index(
-            field_name="sparse_embedding",
+            field_name=sparse_field,
             index_type="SPARSE_INVERTED_INDEX",
-            metric_type="BM25",
+            metric_type="BM25" if sparse_mode == "bm25" else "IP",
             params={"drop_ratio_build": 0.2},
         )
         client.create_collection(
@@ -347,7 +384,12 @@ class MilvusStore:
             dense_dim = int(os.getenv("DENSE_EMBEDDING_DIM", "1024"))
 
         def _init(client: MilvusClient) -> None:
-            self.ensure_collection(client, self.collection_name, dense_dim)
+            self.ensure_collection(
+                client,
+                self.collection_name,
+                dense_dim,
+                sparse_mode=self._settings.sparse_mode,
+            )
 
         self._run(_init)
 
@@ -363,6 +405,7 @@ class MilvusStore:
                 self.collection_name,
                 dense_dim,
                 include_catalog_fields=True,
+                sparse_mode=self._settings.sparse_mode,
             )
 
         self._run(_init)
@@ -446,8 +489,25 @@ class MilvusStore:
         rrf_k: int = 60,
         filter_expr: str = "",
         timeout: float | None = None,
+        sparse_embedding: Mapping[int, float] | None = None,
     ) -> list[dict]:
         output_fields = RETRIEVAL_OUTPUT_FIELDS
+        if self._settings.sparse_mode == "bge_m3":
+            if not sparse_embedding:
+                raise ValueError("BGE-M3 retrieval requires a sparse query vector")
+            if any(
+                isinstance(token_id, bool)
+                or not isinstance(token_id, int)
+                or token_id < 0
+                or isinstance(weight, bool)
+                or not isinstance(weight, (int, float))
+                or not math.isfinite(float(weight))
+                or float(weight) <= 0
+                for token_id, weight in sparse_embedding.items()
+            ):
+                raise ValueError("invalid BGE-M3 sparse query vector")
+        elif sparse_embedding is not None:
+            raise ValueError("BM25 retrieval does not accept a model sparse vector")
         try:
             dense_search = AnnSearchRequest(
                 data=[dense_embedding],
@@ -457,15 +517,30 @@ class MilvusStore:
                 expr=filter_expr,
             )
             sparse_search = AnnSearchRequest(
-                data=[query],
-                anns_field="sparse_embedding",
-                param={"metric_type": "BM25", "params": {"drop_ratio_search": 0.2}},
+                data=[
+                    query
+                    if self._settings.sparse_mode == "bm25"
+                    else dict(sparse_embedding or {})
+                ],
+                anns_field=(
+                    "sparse_embedding"
+                    if self._settings.sparse_mode == "bm25"
+                    else "m3_sparse_embedding"
+                ),
+                param={
+                    "metric_type": (
+                        "BM25" if self._settings.sparse_mode == "bm25" else "IP"
+                    ),
+                    "params": {"drop_ratio_search": 0.2},
+                },
                 limit=top_k * 2,
                 expr=filter_expr,
             )
             reranker = RRFRanker(k=rrf_k)
         except Exception as exc:
-            if _is_hybrid_capability_error(exc):
+            if self._settings.sparse_mode == "bm25" and _is_hybrid_capability_error(
+                exc
+            ):
                 raise HybridRetrievalUnsupported from exc
             raise
 
@@ -482,7 +557,9 @@ class MilvusStore:
         try:
             results = self._run(_search)
         except Exception as exc:
-            if _is_hybrid_capability_error(exc):
+            if self._settings.sparse_mode == "bm25" and _is_hybrid_capability_error(
+                exc
+            ):
                 raise HybridRetrievalUnsupported from exc
             raise
         return [_format_retrieval_hit(hit) for hit in _single_query_hits(results)]
